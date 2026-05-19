@@ -1,0 +1,107 @@
+const { Op } = require('sequelize');
+
+class SyncSaleExportService {
+  constructor(models) {
+    this.models = models;
+  }
+
+  resolveDispatchDocument(dispatchResult) {
+    return {
+      document_number: dispatchResult.documentNumber || dispatchResult.orderNumber || null,
+      document_uniquifier: dispatchResult.documentUniquifier || dispatchResult.orderUniquifier || null,
+      sage_reference: dispatchResult.documentReference || dispatchResult.orderReference || null,
+    };
+  }
+
+  async findExportsBySales(storeId, saleIds, documentType) {
+    if (!storeId || saleIds.length === 0) {
+      return [];
+    }
+
+    return this.models.syncSaleExport.findAll({
+      where: {
+        store_id: storeId,
+        document_type: documentType,
+        sale_id: {
+          [Op.in]: saleIds.map((saleId) => String(saleId)),
+        },
+      },
+      order: [['id', 'ASC']],
+    });
+  }
+
+  buildSharedDocumentMap(sales, dispatchResult) {
+    const sharedDocument = this.resolveDispatchDocument(dispatchResult);
+
+    return new Map(sales.map((sale) => [String(sale.id), {
+      sale_id: String(sale.id),
+      receipt_number: sale.receipt_number || null,
+      document_number: sharedDocument.document_number,
+      document_uniquifier: sharedDocument.document_uniquifier,
+      sage_reference: sharedDocument.sage_reference,
+    }]));
+  }
+
+  buildPerSaleDocumentMap(dispatchResult) {
+    const documents = dispatchResult.perSaleDocuments || [];
+    return new Map(documents.map((document) => [String(document.sale_id), {
+      sale_id: String(document.sale_id),
+      receipt_number: document.receipt_number || null,
+      document_number: document.document_number,
+      document_uniquifier: document.document_uniquifier || null,
+      sage_reference: document.sage_reference || null,
+    }]));
+  }
+
+  async persistExports(syncEvent, sales, dispatchResult, documentType) {
+    if (!syncEvent || sales.length === 0 || !documentType) {
+      return [];
+    }
+
+    const documentMap = dispatchResult.perSaleDocuments?.length
+      ? this.buildPerSaleDocumentMap(dispatchResult)
+      : this.buildSharedDocumentMap(sales, dispatchResult);
+
+    const persisted = [];
+
+    for (const sale of sales) {
+      const saleId = String(sale.id);
+      const document = documentMap.get(saleId);
+      if (!document?.document_number) {
+        continue;
+      }
+
+      const defaults = {
+        sync_event_id: syncEvent.id,
+        store_id: syncEvent.store_id,
+        sale_id: saleId,
+        receipt_number: document.receipt_number,
+        document_type: documentType,
+        day_end_idempotency_key: syncEvent.idempotency_key,
+        sage_document_number: document.document_number,
+        sage_document_uniquifier: document.document_uniquifier,
+        sage_reference: document.sage_reference,
+        exported_at: new Date(),
+      };
+
+      const [record] = await this.models.syncSaleExport.findOrCreate({
+        where: {
+          store_id: syncEvent.store_id,
+          sale_id: saleId,
+          document_type: documentType,
+        },
+        defaults,
+      });
+
+      if (!record.exported_at || !record.sage_document_number || !record.day_end_idempotency_key) {
+        await record.update(defaults);
+      }
+
+      persisted.push(record);
+    }
+
+    return persisted;
+  }
+}
+
+module.exports = SyncSaleExportService;
