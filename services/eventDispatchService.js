@@ -1,4 +1,5 @@
 const SageOrdersService = require('./sage/createSageOrder');
+const SageCreditNoteService = require('./sage/createSageCreditNote');
 const SyncSaleExportService = require('./syncSaleExportService');
 
 const DOCUMENT_TYPES = {
@@ -9,6 +10,7 @@ class EventDispatchService {
   constructor(models) {
     this.models = models;
     this.sageOrdersService = new SageOrdersService();
+    this.sageCreditNoteService = new SageCreditNoteService();
     this.syncSaleExportService = new SyncSaleExportService(models);
   }
 
@@ -86,6 +88,29 @@ class EventDispatchService {
   }
 
   async dispatch(syncEvent) {
+    if (syncEvent.event_type === 'credit_note.created') {
+      const payload = syncEvent.payload || {};
+      const creditNote = payload.credit_note || {};
+      const items = payload.items || [];
+      const user = { store: payload.store || null };
+
+      const result = await this.sageCreditNoteService.createCreditNoteReturn(
+        creditNote,
+        items,
+        user,
+        payload.original_sale || null,
+        {
+          reconcileExisting: (syncEvent.retry_count || 0) > 0,
+          batchDescription: payload.credit_note?.reference || creditNote.reference || undefined,
+        }
+      );
+
+      return {
+        ...result,
+        creditNoteReference: creditNote.reference || creditNote.receipt_number || null,
+      };
+    }
+
     if (syncEvent.event_type === 'sale.created') {
       return {
         success: true,

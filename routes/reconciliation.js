@@ -5,12 +5,13 @@ const { reconAuth } = require('../middleware/reconAuth');
 
 const router = express.Router();
 
-const RELEVANT_EVENT_TYPES = ['day_end.ready'];
+const RELEVANT_EVENT_TYPES = ['day_end.ready', 'credit_note.created'];
 const SALES_EVENT_TYPE = 'day_end.ready';
 const ZRA_COMPLIANCE_EVENT_TYPE = 'sale.created';
 const EVENT_TYPE_LABELS = {
   'day_end.ready': 'OE Order Batch',
   'sale.created': 'Sale Created',
+  'credit_note.created': 'Credit Note Return',
 };
 const STATUS_BUCKETS = {
   completed: 'completed',
