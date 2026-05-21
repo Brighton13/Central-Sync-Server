@@ -6,6 +6,7 @@ const reconAuthRoutes = require('./routes/reconAuth');
 const customerRoutes = require('./routes/customers');
 const reconciliationRoutes = require('./routes/reconciliation');
 const syncRoutes = require('./routes/sync');
+const updateRoutes = require('./routes/updates');
 
 const app = express();
 
@@ -17,6 +18,7 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'central-sync-server', timestamp: new Date().toISOString() });
 });
 
+app.use('/updates', updateRoutes);
 app.use('/api/recon/auth', reconAuthRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/recon', reconciliationRoutes);
