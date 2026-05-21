@@ -93,6 +93,8 @@ class EventDispatchService {
       const creditNote = payload.credit_note || {};
       const items = payload.items || [];
       const user = { store: payload.store || null };
+      const branchId = this.resolveBranchId(payload, user);
+      const terminalId = this.resolveTerminalId(payload, user);
 
       const result = await this.sageCreditNoteService.createCreditNoteReturn(
         creditNote,
@@ -101,7 +103,9 @@ class EventDispatchService {
         payload.original_sale || null,
         {
           reconcileExisting: (syncEvent.retry_count || 0) > 0,
-          batchDescription: payload.credit_note?.reference || creditNote.reference || undefined,
+          orderReference: payload.credit_note?.reference || creditNote.reference || undefined,
+          branchId,
+          terminalId,
         }
       );
 

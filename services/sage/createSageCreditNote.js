@@ -35,7 +35,6 @@ class SageCreditNoteService {
   normalizeItem(item) {
     const quantity = Number(item.quantity || 0);
     const unitPrice = Number(item.unit_price || 0);
-    const totalPrice = item.total_price != null ? Number(item.total_price) : quantity * unitPrice;
     const code = item.product?.formatted_product_code
       || item.product?.product_code
       || item.product_code
@@ -45,70 +44,56 @@ class SageCreditNoteService {
     return {
       quantity,
       unitPrice: this.to4(unitPrice),
-      totalPrice: this.to4(totalPrice),
       code,
       description,
     };
   }
 
-  buildBatchDescription(creditNote, originalSale, date) {
+  buildOrderReference(creditNote, originalSale, date) {
     const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || 'CREDIT-NOTE';
     const originalSaleRef = originalSale?.receipt_number || originalSale?.invoice_no || originalSale?.receipt_no || originalSale?.id || 'SALE';
     const datePart = date ? new Date(date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
     return `CN ${creditNoteRef} / ${originalSaleRef} - ${datePart}`;
   }
 
-  buildInvoiceDetails(items, user, batchEntryNumber, creditNoteRef) {
-    let lineNumber = 1;
+  buildOrderDetails(items, user, creditNoteRef) {
+    let detailNumber = 1;
     return items.map((rawItem) => {
       const item = this.normalizeItem(rawItem);
-      const taxRate = 16;
-      const taxExclusiveTotalBase = rawItem.tax_exclusive_total != null
-        ? Number(rawItem.tax_exclusive_total)
-        : (item.totalPrice / (1 + (taxRate / 100)));
-      const taxAmount = item.totalPrice - taxExclusiveTotalBase;
 
       const detail = {
-        BatchNumber: 0,
-        EntryNumber: batchEntryNumber,
-        LineNumber: lineNumber * 20,
+        LineNumber: detailNumber * 32,
+        LineType: 'Item',
+        Item: item.code,
         Description: `${creditNoteRef} - ${item.description}`,
-        Quantity: item.quantity,
-        Price: this.to4(item.unitPrice),
-        ExtendedAmountWithoutTIP: this.to4(taxExclusiveTotalBase),
-        ExtendedAmountWithTIP: this.to4(item.totalPrice),
-        RevenueAccount: user?.store?.store_rev_account,
+        Category: user?.store?.store_number || '',
+        Location: user?.store?.store_number || '',
+        StockItem: true,
+        QuantityOrdered: item.quantity,
+        OrderUnitOfMeasure: 'EACH',
+        OrderUnitConversion: 1,
+        OrderUnitPrice: this.to4(item.unitPrice),
+        PriceOverride: true,
+        PricingUnitOfMeasure: 'EACH',
+        PricingUnitPrice: this.to4(item.unitPrice),
+        PricingUnitConversion: 1,
+        DetailNumber: detailNumber,
+        TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
+        TaxClass1: 1,
+        TaxIncluded1: true,
         UpdateOperation: 'Unspecified',
-        TaxTotal: this.to4(taxAmount),
-        TaxBase1: this.to4(taxExclusiveTotalBase),
-        TaxAmount1: this.to4(taxAmount),
-        TaxIncluded1: 'Yes',
-        FunctionalTaxBase1: this.to4(taxExclusiveTotalBase),
-        FunctionalTaxAmount1: this.to4(taxAmount),
-        TaxAmount1Total: this.to4(taxAmount),
       };
 
-      lineNumber += 1;
+      detailNumber += 1;
       return detail;
     });
   }
 
-  async findExistingCreditNoteBatch(batchDescription) {
-    if (!batchDescription) {
+  extractOrderEntity(payload) {
+    if (!payload) {
       return null;
     }
 
-    const { baseUrl, headers } = this.getAuthConfig();
-    const response = await axios.get(`${baseUrl}/AR/ARInvoiceBatches`, {
-      headers,
-      params: {
-        $filter: `Description eq '${String(batchDescription).replace(/'/g, "''")}'`,
-        $top: 1,
-      },
-      timeout: this.timeout,
-    });
-
-    const payload = response.data;
     if (Array.isArray(payload?.value)) {
       return payload.value[0] || null;
     }
@@ -117,119 +102,109 @@ class SageCreditNoteService {
       return payload[0] || null;
     }
 
-    return payload?.BatchNumber ? payload : null;
+    return payload?.OrderNumber ? payload : null;
   }
 
-  isReusableBatch(batch) {
-    if (!batch) {
-      return false;
+  escapeODataString(value) {
+    return String(value).replace(/'/g, "''");
+  }
+
+  async findExistingCreditNoteOrder(orderReference) {
+    if (!orderReference) {
+      return null;
     }
 
-    const status = String(batch.BatchStatus || batch.Status || batch.batchStatus || batch.status || '').trim().toLowerCase();
-    const total = Number(batch.BatchTotal ?? batch.batchTotal ?? batch.DocumentTotalIncludingTax ?? batch.documentTotalIncludingTax ?? 0);
+    const { baseUrl, headers } = this.getAuthConfig();
+    const response = await axios.get(`${baseUrl}/OE/OEOrders`, {
+      headers,
+      params: {
+        $filter: `OrderReference eq '${this.escapeODataString(orderReference)}'`,
+        $top: 1,
+      },
+      timeout: this.timeout,
+    });
 
-    if (!Number.isFinite(total) || total <= 0) {
-      return false;
-    }
-
-    return status !== 'deleted';
+    return this.extractOrderEntity(response.data);
   }
 
   async createCreditNoteReturn(creditNote, items, user, originalSale = null, options = {}) {
     const { baseUrl, headers } = this.getAuthConfig();
-    const batchDate = creditNote?.credit_note_date || new Date().toISOString();
-    const batchDescription = options.batchDescription || this.buildBatchDescription(creditNote, originalSale, batchDate);
-    const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || batchDescription;
+    const orderDate = creditNote?.credit_note_date || new Date().toISOString();
+    const orderReference = options.orderReference || this.buildOrderReference(creditNote, originalSale, orderDate);
+    const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || orderReference;
+    const orderDescription = `${creditNoteRef}${originalSale?.receipt_number ? ` / ${originalSale.receipt_number}` : ''}`;
 
-    if (options.reconcileExisting && batchDescription) {
-      const existingBatch = await this.findExistingCreditNoteBatch(batchDescription);
-      if (this.isReusableBatch(existingBatch)) {
+    if (options.reconcileExisting && orderReference) {
+      const existingOrder = await this.findExistingCreditNoteOrder(orderReference);
+      if (existingOrder) {
         return {
           success: true,
           status: 200,
-          data: existingBatch,
-          responseBody: existingBatch,
-          sageResponse: existingBatch,
-          documentNumber: existingBatch.BatchNumber == null ? null : String(existingBatch.BatchNumber),
-          documentUniquifier: existingBatch.BatchNumber == null ? null : String(existingBatch.BatchNumber),
-          documentReference: batchDescription,
+          data: existingOrder,
+          responseBody: existingOrder,
+          sageResponse: existingOrder,
+          documentNumber: existingOrder.OrderNumber || null,
+          documentUniquifier: existingOrder.OrderUniquifier == null ? null : String(existingOrder.OrderUniquifier),
+          documentReference: existingOrder.OrderReference || orderReference,
           existingDocument: true,
         };
       }
     }
 
-    const taxRate = 16;
-    const invoiceDetails = this.buildInvoiceDetails(items, user, 1, creditNoteRef);
-    const totalBeforeTax = this.to4((items || []).reduce((sum, item) => {
-      if (item.tax_exclusive_total != null) {
-        return sum + Number(item.tax_exclusive_total);
-      }
-      const normalized = this.normalizeItem(item);
-      return sum + (normalized.totalPrice / (1 + (taxRate / 100)));
-    }, 0));
-    const totalTax = this.to4((items || []).reduce((sum, item) => {
-      if (item.tax_exclusive_total != null) {
-        const total = Number(item.total_price || 0);
-        return sum + (total - Number(item.tax_exclusive_total));
-      }
-      const normalized = this.normalizeItem(item);
-      const base = normalized.totalPrice / (1 + (taxRate / 100));
-      return sum + (normalized.totalPrice - base);
-    }, 0));
-    const totalWithTax = this.to4(totalBeforeTax + totalTax);
+    const orderDetails = this.buildOrderDetails(items, user, creditNoteRef);
+    const totalFromCreditNote = Number(creditNote?.total_amount || 0);
+    const fallbackFromLines = orderDetails.reduce((sum, detail) => (
+      sum + (Number(detail.OrderUnitPrice) * Number(detail.QuantityOrdered))
+    ), 0);
+    const orderTotal = this.to4(totalFromCreditNote || fallbackFromLines);
 
-    const batch = {
-      BatchNumber: 0,
-      BatchDate: new Date(batchDate).toISOString(),
-      DateLastEdited: new Date().toISOString(),
-      Description: batchDescription,
-      BatchType: 'Entered',
-      BatchStatus: 'Open',
-      BatchTotal: totalWithTax,
-      DefaultInvoiceType: 'Item',
-      ProcessCommand: 'UnlockBatchResource',
-      Invoices: [{
-        BatchNumber: 0,
-        EntryNumber: 1,
-        CustomerNumber: user?.store?.store_customer_number,
-        DateGenerated: new Date(batchDate).toISOString(),
-        PostingDate: new Date(batchDate).toISOString(),
-        DueDate: new Date(batchDate).toISOString(),
-        AsOfDate: new Date(batchDate).toISOString(),
-        DocumentDate: new Date(batchDate).toISOString(),
-        DocumentType: 'CreditNote',
-        TransactionType: 'CreditNoteSummaryIssued',
-        InvoiceDescription: `${creditNoteRef}${originalSale?.receipt_number ? ` / ${originalSale.receipt_number}` : ''}`,
-        InvoicePrinted: 'No',
-        CurrencyCode: user?.store?.currency || creditNote?.currency || 'ZMW',
-        Terms: user?.store?.terms_code || 'COD',
-        Taxable: taxRate > 0 ? 'Yes' : 'No',
-        TaxGroup: user?.store?.store_tax_group || 'VATZMW',
-        InvoiceType: 'Summary',
-        AmountDue: totalWithTax,
-        TaxBase1: totalBeforeTax,
-        FunctionalTaxBase1: totalBeforeTax,
-        TaxAmount1: totalTax,
-        TaxAmount1Total: totalTax,
-        FunctionalTaxAmount1: totalTax,
-        DocumentTotalBeforeTax: totalBeforeTax,
-        DocumentTotalIncludingTax: totalWithTax,
-        ProcessCommand: 'CalculateTaxes',
-        InvoiceDetails: invoiceDetails,
-        InvoicePaymentSchedules: [{
-          BatchNumber: 0,
-          EntryNumber: 1,
-          PaymentNumber: 1,
-          DueDate: new Date(batchDate).toISOString(),
-          AmountDue: totalWithTax,
-          FunctionalAmountDue: totalWithTax,
-          UpdateOperation: 'Unspecified',
-        }],
-        UpdateOperation: 'Unspecified',
-      }],
+    const order = {
+      OrderUniquifier: 0,
+      OrderNumber: '*** NEW ***',
+      OrderReference: orderReference,
+      CustomerNumber: user?.store?.store_customer_number || creditNote?.customer?.customer_number || '1101',
+      CustomerGroupCode: user?.store?.currency || creditNote?.currency || 'ZMW',
+      ShipToName: creditNote?.customer?.name || user?.store?.store_location || 'POS Customer',
+      ShipToAddressLine1: '',
+      ShipToCity: '',
+      OrderDescription: orderDescription,
+      CustomerDiscountLevel: 'Base',
+      DefaultPriceListCode: user?.store?.price_list_code || '01',
+      TermsCode: user?.store?.terms_code || 'COD',
+      OrderType: 'Active',
+      OrderDate: new Date(orderDate).toISOString(),
+      ExpectedShipDate: new Date(orderDate).toISOString(),
+      OrderFiscalYear: String(new Date(orderDate).getUTCFullYear()),
+      OrderFiscalPeriod: `Num${new Date(orderDate).getUTCMonth() + 1}`,
+      DefaultLocationCode: user?.store?.store_number || '',
+      OnHold: false,
+      OrderHomeCurrency: user?.store?.currency || creditNote?.currency || 'ZMW',
+      OrderRateType: 'SP',
+      OrderSourceCurrency: user?.store?.currency || creditNote?.currency || 'ZMW',
+      OrderRateDate: new Date(orderDate).toISOString(),
+      OrderRate: 1,
+      OrderRateDateMatching: 3,
+      OrderRateOperator: 1,
+      OrderRateOverrideFlag: false,
+      TaxGroup: user?.store?.store_tax_group || 'VATZMW',
+      TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
+      TaxClass1: 1,
+      OrderCompleted: 'IncompleteNotIncluded',
+      PostInvoice: false,
+      TaxReportingTRCurrency: user?.store?.currency || creditNote?.currency || 'ZMW',
+      TRRateType: 'SP',
+      TRRateDate: new Date(orderDate).toISOString(),
+      TRRate: 1,
+      TRRateDateMatching: 1,
+      TRRateOperator: 1,
+      OrderDetails: orderDetails,
+      OrderTotal: orderTotal,
+      OrderInclTaxTotal: orderTotal,
+      NumberOfLinesOnOrder: orderDetails.length,
+      UpdateOperation: 'Unspecified',
     };
 
-    const response = await axios.post(`${baseUrl}/AR/ARInvoiceBatches`, batch, {
+    const response = await axios.post(`${baseUrl}/OE/OEOrders`, order, {
       headers,
       timeout: this.timeout,
     });
@@ -240,9 +215,9 @@ class SageCreditNoteService {
       data: response.data,
       responseBody: response.data,
       sageResponse: response.data,
-      documentNumber: response.data?.BatchNumber == null ? null : String(response.data.BatchNumber),
-      documentUniquifier: response.data?.BatchNumber == null ? null : String(response.data.BatchNumber),
-      documentReference: batchDescription,
+      documentNumber: response.data?.OrderNumber || null,
+      documentUniquifier: response.data?.OrderUniquifier == null ? null : String(response.data.OrderUniquifier),
+      documentReference: response.data?.OrderReference || orderReference,
       existingDocument: false,
     };
   }

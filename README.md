@@ -10,14 +10,14 @@ Collects sync events from multiple POS backends, persists them with idempotency 
 - Enqueues BullMQ jobs in Redis
 - Processes queued jobs in a worker
 - Dispatches `day_end.ready` payloads to Sage OE Orders
-- Dispatches `credit_note.created` payloads to Sage AR credit-note batches
+- Dispatches `credit_note.created` payloads to Sage OE Orders for return handling
 - Stores worker results and failures on the sync event row
 
 ## Supported events
 
 - `sale.created`: staged and stored for audit/tracing
 - `day_end.ready`: converted into a consolidated Sage OE Order request
-- `credit_note.created`: converted into a Sage credit-note batch for the original sale reversal
+- `credit_note.created`: converted into a Sage OE Order request for the original sale reversal
 
 ## Required services
 
