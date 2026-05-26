@@ -1,7 +1,8 @@
 const express = require('express');
 const { Op } = require('sequelize');
 
-const { reconAuth } = require('../middleware/reconAuth');
+const { reconAuth, requireReconRole } = require('../middleware/reconAuth');
+const { queueSyncEvent } = require('../services/syncEventQueueService');
 
 const router = express.Router();
 
@@ -960,6 +961,29 @@ router.get('/batches', reconAuth, async (req, res) => {
     },
     pagination: paginated.pagination,
     rows: paginated.rows,
+  });
+});
+
+router.post('/batches/:id/requeue', reconAuth, requireReconRole('admin'), async (req, res) => {
+  const models = req.app.locals.models;
+  const syncEvent = await models.syncEvent.findByPk(req.params.id);
+
+  if (!syncEvent) {
+    return res.status(404).json({ message: 'Sync event not found' });
+  }
+
+  if (syncEvent.status === 'completed') {
+    return res.status(409).json({ message: 'This event has already completed and cannot be requeued' });
+  }
+
+  const job = await queueSyncEvent(syncEvent);
+
+  return res.json({
+    success: true,
+    eventId: syncEvent.id,
+    queued: true,
+    jobId: job.id,
+    event: serializeSyncEvent(syncEvent),
   });
 });
 
