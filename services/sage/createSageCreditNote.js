@@ -115,16 +115,33 @@ class SageCreditNoteService {
     }
 
     const { baseUrl, headers } = this.getAuthConfig();
-    const response = await axios.get(`${baseUrl}/OE/OEOrders`, {
-      headers,
-      params: {
-        $filter: `OrderReference eq '${this.escapeODataString(orderReference)}'`,
-        $top: 1,
-      },
+    console.log('[SageCreditNoteService] findExistingCreditNoteOrder:', {
+      orderReference,
+      url: `${baseUrl}/OE/OEOrders`,
       timeout: this.timeout,
     });
 
-    return this.extractOrderEntity(response.data);
+    try {
+      const response = await axios.get(`${baseUrl}/OE/OEOrders`, {
+        headers,
+        params: {
+          $filter: `OrderReference eq '${this.escapeODataString(orderReference)}'`,
+          $top: 1,
+        },
+        timeout: this.timeout,
+      });
+
+      console.log('[SageCreditNoteService] findExistingCreditNoteOrder response status:', response.status);
+      return this.extractOrderEntity(response.data);
+    } catch (error) {
+      console.error('[SageCreditNoteService] findExistingCreditNoteOrder error:', {
+        orderReference,
+        message: error.message,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      throw error;
+    }
   }
 
   async createCreditNoteReturn(creditNote, items, user, originalSale = null, options = {}) {
@@ -204,22 +221,41 @@ class SageCreditNoteService {
       UpdateOperation: 'Unspecified',
     };
 
-    const response = await axios.post(`${baseUrl}/OE/OEOrders`, order, {
-      headers,
+    console.log('[SageCreditNoteService] createCreditNoteReturn sending order:', {
+      orderReference,
+      url: `${baseUrl}/OE/OEOrders`,
+      OrderTotal: order.OrderTotal,
+      NumberOfLinesOnOrder: order.NumberOfLinesOnOrder,
       timeout: this.timeout,
     });
 
-    return {
-      success: true,
-      status: response.status,
-      data: response.data,
-      responseBody: response.data,
-      sageResponse: response.data,
-      documentNumber: response.data?.OrderNumber || null,
-      documentUniquifier: response.data?.OrderUniquifier == null ? null : String(response.data.OrderUniquifier),
-      documentReference: response.data?.OrderReference || orderReference,
-      existingDocument: false,
-    };
+    try {
+      const response = await axios.post(`${baseUrl}/OE/OEOrders`, order, {
+        headers,
+        timeout: this.timeout,
+      });
+
+      console.log('[SageCreditNoteService] createCreditNoteReturn response status:', response.status);
+      return {
+        success: true,
+        status: response.status,
+        data: response.data,
+        responseBody: response.data,
+        sageResponse: response.data,
+        documentNumber: response.data?.OrderNumber || null,
+        documentUniquifier: response.data?.OrderUniquifier == null ? null : String(response.data.OrderUniquifier),
+        documentReference: response.data?.OrderReference || orderReference,
+        existingDocument: false,
+      };
+    } catch (error) {
+      console.error('[SageCreditNoteService] createCreditNoteReturn error:', {
+        orderReference,
+        message: error.message,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      throw error;
+    }
   }
 }
 
