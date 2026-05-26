@@ -91,12 +91,15 @@ function buildDateRange(query) {
 
   if (!startDate && !endDate) {
     const since = buildDefaultSinceDate(days);
+    const until = new Date();
+    until.setHours(23, 59, 59, 999);
+
     return {
       since,
-      until: null,
+      until,
       days,
       startDate: since.toISOString(),
-      endDate: null,
+      endDate: until.toISOString(),
     };
   }
 
@@ -460,6 +463,12 @@ function buildSaleRow(syncEvent, sale, saleExportRows) {
 }
 
 async function loadEventsWithExports(models, eventTypes, dateRange) {
+  console.log('[reconciliation] loadEventsWithExports start', {
+    eventTypes,
+    startDate: dateRange.startDate,
+    endDate: dateRange.endDate,
+  });
+
   const events = await models.syncEvent.findAll({
     where: {
       event_type: Array.isArray(eventTypes) ? { [Op.in]: eventTypes } : eventTypes,
@@ -475,6 +484,11 @@ async function loadEventsWithExports(models, eventTypes, dateRange) {
       })
     : [];
 
+  console.log('[reconciliation] loadEventsWithExports loaded', {
+    eventCount: plainEvents.length,
+    exportCount: saleExports.length,
+  });
+
   const saleExportsByEventId = groupExportsByEventId(saleExports);
 
   return plainEvents.map((event) => ({
@@ -484,6 +498,11 @@ async function loadEventsWithExports(models, eventTypes, dateRange) {
 }
 
 async function loadExportsWithEvents(models, dateRange) {
+  console.log('[reconciliation] loadExportsWithEvents start', {
+    startDate: dateRange.startDate,
+    endDate: dateRange.endDate,
+  });
+
   const exports = await models.syncSaleExport.findAll({
     where: {
       document_type: 'oe_order',
@@ -498,6 +517,11 @@ async function loadExportsWithEvents(models, dateRange) {
         where: { id: { [Op.in]: eventIds } },
       })
     : [];
+
+  console.log('[reconciliation] loadExportsWithEvents loaded', {
+    exportCount: plainExports.length,
+    linkedEventCount: events.length,
+  });
 
   const eventMap = new Map(
     events.map((event) => {
@@ -516,6 +540,11 @@ router.get('/summary', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
   const limit = parseLimit(req.query.limit);
   const dateRange = buildDateRange(req.query);
+  console.log('[reconciliation] /summary request', {
+    query: req.query,
+    dateRange,
+    limit,
+  });
   const events = await loadEventsWithExports(models, RELEVANT_EVENT_TYPES, dateRange);
   const recentBatchRows = sortByIdDesc(events).slice(0, limit);
   const exportBundle = await loadExportsWithEvents(models, dateRange);
@@ -641,6 +670,18 @@ router.get('/summary', reconAuth, async (req, res) => {
   const postedSalesCount = postedSales.size;
   const pendingSalesCount = Math.max(totalSalesCount - postedSalesCount, 0);
 
+  console.log('[reconciliation] /summary result', {
+    totalBatches,
+    completedBatches,
+    pendingBatches,
+    failedBatches,
+    totalSalesCount,
+    postedSalesCount,
+    pendingSalesCount,
+    totalCreditNotesCount,
+    totalCreditNotesValue,
+  });
+
   return res.json({
     success: true,
     generatedAt: new Date().toISOString(),
@@ -676,6 +717,11 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
   const limit = parseLimit(req.query.limit);
   const dateRange = buildDateRange(req.query);
+  console.log('[reconciliation] /zra-compliance request', {
+    query: req.query,
+    dateRange,
+    limit,
+  });
   const events = await loadEventsWithExports(models, ZRA_COMPLIANCE_EVENT_TYPE, dateRange);
 
   const terminalCompliance = new Map();
@@ -808,6 +854,13 @@ router.get('/sales', reconAuth, async (req, res) => {
     branchId: req.query.branchId || '',
     terminalId: req.query.terminalId || '',
   };
+  console.log('[reconciliation] /sales request', {
+    query: req.query,
+    dateRange,
+    page,
+    pageSize,
+    filters,
+  });
 
   const events = await loadEventsWithExports(models, SALES_EVENT_TYPE, dateRange);
   const branchOptions = collectOptions(events.map((event) => getBranchId(event)));
@@ -832,6 +885,12 @@ router.get('/sales', reconAuth, async (req, res) => {
     }
 
     return Number(right.saleId) - Number(left.saleId);
+  });
+
+  console.log('[reconciliation] /sales prepared rows', {
+    totalRows: rows.length,
+    page,
+    pageSize,
   });
 
   const paginated = paginateRows(orderedRows, page, pageSize);
@@ -863,6 +922,14 @@ router.get('/batches', reconAuth, async (req, res) => {
     terminalId: req.query.terminalId || '',
     status: req.query.status || '',
   };
+  console.log('[reconciliation] /batches request', {
+    query: req.query,
+    dateRange,
+    page,
+    pageSize,
+    eventType,
+    filters,
+  });
 
   const events = await loadEventsWithExports(models, eventType, dateRange);
   const branchOptions = collectOptions(events.map((event) => getBranchId(event)));
@@ -871,6 +938,11 @@ router.get('/batches', reconAuth, async (req, res) => {
     .filter((event) => eventMatchesFilters(event, filters))
     .map(buildBatchRow);
   const paginated = paginateRows(rows, page, pageSize);
+  console.log('[reconciliation] /batches prepared rows', {
+    totalRows: rows.length,
+    page,
+    pageSize,
+  });
 
   return res.json({
     success: true,

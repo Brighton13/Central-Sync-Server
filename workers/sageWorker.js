@@ -1,7 +1,45 @@
 const { Worker } = require('bullmq');
+const axios = require('axios');
 const { connectionOptions } = require('../config/redis');
 const { SAGE_DISPATCH_QUEUE } = require('../queues/syncQueues');
 const EventDispatchService = require('../services/eventDispatchService');
+
+const callbackUrl = String(process.env.POS_BACKEND_CALLBACK_URL || '').replace(/\/$/, '');
+const callbackToken = String(process.env.POS_BACKEND_CALLBACK_TOKEN || process.env.SYNC_SERVER_TOKEN || '').trim();
+
+async function notifyPosBackend(syncEvent, result) {
+  if (!callbackUrl || !callbackToken) {
+    return;
+  }
+
+  try {
+    await axios.post(
+      `${callbackUrl}/api/sync/status`,
+      {
+        event_type: syncEvent.event_type,
+        aggregate_type: syncEvent.aggregate_type,
+        aggregate_id: syncEvent.aggregate_id,
+        store_id: syncEvent.store_id,
+        idempotency_key: syncEvent.idempotency_key,
+        status: 'accepted',
+        response_payload: result,
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${callbackToken}`,
+        },
+        timeout: 15000,
+      }
+    );
+  } catch (error) {
+    console.error('Failed to notify POS backend of accepted sync event:', {
+      eventId: syncEvent.id,
+      error: error.message,
+      response: error.response?.data || null,
+    });
+  }
+}
 
 function createSageWorker(models) {
   const dispatchService = new EventDispatchService(models);
@@ -28,6 +66,9 @@ function createSageWorker(models) {
           last_error: null,
           response_payload: result,
         });
+
+        await notifyPosBackend(syncEvent, result);
+
         return result;
       } catch (error) {
         const retryCount = (syncEvent.retry_count || 0) + 1;
