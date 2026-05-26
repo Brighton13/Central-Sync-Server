@@ -9,6 +9,20 @@ async function queueSyncEvent(syncEvent) {
   const jobId = buildQueueJobId(syncEvent.id);
   let job = await sageDispatchQueue.getJob(jobId);
 
+  if (job) {
+    const state = await job.getState();
+    const isActive = ['waiting', 'active', 'delayed', 'paused'].includes(state);
+
+    if (!isActive) {
+      try {
+        await job.remove();
+      } catch (removeError) {
+        console.warn(`Failed to remove old job ${jobId} in state ${state}:`, removeError?.message || removeError);
+      }
+      job = null;
+    }
+  }
+
   if (!job) {
     job = await sageDispatchQueue.add(syncEvent.event_type, {
       syncEventId: syncEvent.id,

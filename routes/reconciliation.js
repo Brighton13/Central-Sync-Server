@@ -144,6 +144,17 @@ function getTerminalId(syncEvent) {
   return payload.terminal_id || payload.branch_id || null;
 }
 
+function serializeSyncEvent(syncEvent) {
+  const plain = syncEvent.toJSON ? syncEvent.toJSON() : syncEvent;
+  return {
+    ...plain,
+    branch_id: plain.payload?.branch_id || null,
+    terminal_id: getTerminalId(plain),
+    response_body: plain.response_payload || null,
+    sage_response: plain.response_payload?.sageResponse || plain.response_payload?.responseBody || plain.response_payload?.data || null,
+  };
+}
+
 function getComplianceSale(syncEvent) {
   const payload = getPayload(syncEvent);
   if (payload.sale && typeof payload.sale === 'object') {
