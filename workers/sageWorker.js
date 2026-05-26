@@ -51,7 +51,11 @@ function createSageWorker(models) {
       console.log(`[sageWorker] starting job ${job.id} for syncEventId=${job.data.syncEventId}`);
       const syncEvent = await models.syncEvent.findByPk(job.data.syncEventId);
       if (!syncEvent) {
-        throw new Error(`Sync event ${job.data.syncEventId} not found`);
+        console.warn(`[sageWorker] stale job ${job.id}: syncEventId=${job.data.syncEventId} not found. Completing job without retry.`);
+        return {
+          success: false,
+          message: `sync event ${job.data.syncEventId} not found`,
+        };
       }
 
       await syncEvent.update({
