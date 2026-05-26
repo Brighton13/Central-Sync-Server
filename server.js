@@ -97,11 +97,17 @@ async function start() {
   await ensureDefaultReconUsers(models);
 
   sageWorker = createSageWorker(models);
+  sageWorker.on('active', (job) => {
+    console.log(`Sage worker active job ${job.id} for syncEventId=${job.data?.syncEventId}`);
+  });
   sageWorker.on('completed', (job) => {
     console.log(`Sage worker completed job ${job.id}`);
   });
   sageWorker.on('failed', (job, error) => {
     console.error(`Sage worker failed job ${job?.id}:`, error.message);
+  });
+  sageWorker.on('error', (error) => {
+    console.error('[sageWorker] worker-level error:', error?.message || error);
   });
 
   const recoveredCount = await recoverIncompleteEvents(models);

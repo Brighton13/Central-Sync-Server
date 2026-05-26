@@ -42,11 +42,13 @@ async function notifyPosBackend(syncEvent, result) {
 }
 
 function createSageWorker(models) {
+  console.log('[sageWorker] initializing Sage worker');
   const dispatchService = new EventDispatchService(models);
 
   return new Worker(
     SAGE_DISPATCH_QUEUE,
     async (job) => {
+      console.log(`[sageWorker] starting job ${job.id} for syncEventId=${job.data.syncEventId}`);
       const syncEvent = await models.syncEvent.findByPk(job.data.syncEventId);
       if (!syncEvent) {
         throw new Error(`Sync event ${job.data.syncEventId} not found`);
@@ -89,7 +91,10 @@ function createSageWorker(models) {
       connection: connectionOptions,
       concurrency: Number(process.env.WORKER_CONCURRENCY || 2),
     }
-  );
+  )
+    .on('error', (error) => {
+      console.error('[sageWorker] worker error:', error?.message || error);
+    });
 }
 
 module.exports = {
