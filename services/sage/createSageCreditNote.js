@@ -53,7 +53,8 @@ class SageCreditNoteService {
     const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || 'CREDIT-NOTE';
     const originalSaleRef = originalSale?.receipt_number || originalSale?.invoice_no || originalSale?.receipt_no || originalSale?.id || 'SALE';
     const datePart = date ? new Date(date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-    return `CN ${creditNoteRef} / ${originalSaleRef} - ${datePart}`;
+    const sdcSuffix = creditNote?.sdcid ? ` / SDC:${creditNote.sdcid}` : '';
+    return `CN ${creditNoteRef} / ${originalSaleRef} - ${datePart}${sdcSuffix}`;
   }
 
   buildOrderDetails(items, user, creditNoteRef) {
@@ -149,7 +150,9 @@ class SageCreditNoteService {
     const orderDate = creditNote?.credit_note_date || new Date().toISOString();
     const orderReference = options.orderReference || this.buildOrderReference(creditNote, originalSale, orderDate);
     const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || orderReference;
-    const orderDescription = `${creditNoteRef}${originalSale?.receipt_number ? ` / ${originalSale.receipt_number}` : ''}`;
+    const sdcTag = creditNote?.sdcid ? ` | SDC:${creditNote.sdcid}` : '';
+    const invoiceTag = creditNote?.invoice_no ? ` | INV:${creditNote.invoice_no}` : '';
+    const orderDescription = `${creditNoteRef}${originalSale?.receipt_number ? ` / ${originalSale.receipt_number}` : ''}${sdcTag}${invoiceTag}`;
 
     if (options.reconcileExisting && orderReference) {
       const existingOrder = await this.findExistingCreditNoteOrder(orderReference);
