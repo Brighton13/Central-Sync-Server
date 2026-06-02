@@ -130,6 +130,27 @@ function buildRangeWhere(dateRange) {
   return where;
 }
 
+function isDateInRange(rawDate, dateRange) {
+  if (!rawDate) {
+    return false;
+  }
+
+  const date = new Date(rawDate);
+  if (Number.isNaN(date.getTime())) {
+    return false;
+  }
+
+  if (dateRange.since && date < dateRange.since) {
+    return false;
+  }
+
+  if (dateRange.until && date > dateRange.until) {
+    return false;
+  }
+
+  return true;
+}
+
 function getPayload(syncEvent) {
   return syncEvent.payload || {};
 }
@@ -455,7 +476,7 @@ function buildSaleRow(syncEvent, sale, saleExportRows) {
     branchId: getBranchId(syncEvent) || 'Unassigned',
     terminalId: getTerminalId(syncEvent) || 'Unassigned',
     storeId: syncEvent.store_id,
-    saleDate: getPayload(syncEvent).date || syncEvent.received_at,
+    saleDate: sale.sale_date || sale.date || getPayload(syncEvent).date || syncEvent.received_at,
     batchReceivedAt: syncEvent.received_at,
     amount: roundCurrency(sale.total_amount),
     paymentMethod: sale.payment_method || null,
@@ -887,7 +908,11 @@ router.get('/sales', reconAuth, async (req, res) => {
     const saleExportsBySaleId = groupExportsBySaleId(syncEvent.saleExports || []);
 
     for (const sale of getSales(syncEvent)) {
-      rows.push(buildSaleRow(syncEvent, sale, saleExportsBySaleId.get(String(sale.id)) || []));
+      const row = buildSaleRow(syncEvent, sale, saleExportsBySaleId.get(String(sale.id)) || []);
+      if (!isDateInRange(row.saleDate, dateRange)) {
+        continue;
+      }
+      rows.push(row);
     }
   }
 
