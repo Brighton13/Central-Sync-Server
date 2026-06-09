@@ -67,7 +67,7 @@ class SageCreditNoteService {
         LineType: 'Item',
         Item: item.code,
         Description: `${creditNoteRef} - ${item.description}`,
-        Category: user?.store?.store_number || '',
+        Category: user?.store?.store_customer_number || '',
         Location: user?.store?.store_number || '',
         StockItem: true,
         QuantityOrdered: item.quantity,
