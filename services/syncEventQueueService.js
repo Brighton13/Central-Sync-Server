@@ -48,7 +48,7 @@ async function recoverIncompleteEvents(models) {
         [Op.in]: ['received', 'queued', 'failed', 'dead_letter'],
       },
     },
-    order: [['id', 'ASC']],
+   // order: [['id', 'ASC']],
   });
 
   for (const syncEvent of events) {
