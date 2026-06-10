@@ -561,6 +561,55 @@ async function loadEventsWithExports(models, eventTypes, dateRange) {
   }));
 }
 
+async function loadExportsForSales(models, events) {
+  const saleIdsByStore = new Map();
+
+  for (const event of events) {
+    const storeId = event.store_id;
+    if (storeId == null) {
+      continue;
+    }
+
+    const idSet = saleIdsByStore.get(storeId) || new Set();
+    for (const sale of getSales(event)) {
+      if (sale && sale.id != null) {
+        idSet.add(String(sale.id));
+      }
+    }
+    saleIdsByStore.set(storeId, idSet);
+  }
+
+  const lookup = new Map();
+
+  for (const [storeId, idSet] of saleIdsByStore.entries()) {
+    const saleIds = Array.from(idSet);
+    if (saleIds.length === 0) {
+      continue;
+    }
+
+    const exports = await models.syncSaleExport.findAll({
+      where: {
+        store_id: storeId,
+        document_type: 'oe_order',
+        sale_id: { [Op.in]: saleIds },
+      },
+      order: [['id', 'ASC']],
+    });
+
+    for (const row of exports) {
+      const plain = row.toJSON ? row.toJSON() : row;
+      lookup.set(makeSaleKey(storeId, plain.sale_id), plain);
+    }
+  }
+
+  console.log('[reconciliation] loadExportsForSales loaded', {
+    storeCount: saleIdsByStore.size,
+    exportCount: lookup.size,
+  });
+
+  return lookup;
+}
+
 async function loadExportsWithEvents(models, dateRange) {
   console.log('[reconciliation] loadExportsWithEvents start', {
     startDate: dateRange.startDate,
@@ -931,6 +980,7 @@ router.get('/sales', reconAuth, async (req, res) => {
   const events = await loadEventsWithExports(models, SALES_EVENT_TYPE, dateRange);
   const branchOptions = collectOptions(events.map((event) => getBranchId(event)));
   const terminalOptions = collectOptions(events.map((event) => getTerminalId(event)));
+  const exportLookup = await loadExportsForSales(models, events);
   const rows = [];
 
   for (const syncEvent of events) {
@@ -941,7 +991,10 @@ router.get('/sales', reconAuth, async (req, res) => {
     const saleExportsBySaleId = groupExportsBySaleId(syncEvent.saleExports || []);
 
     for (const sale of getSales(syncEvent)) {
-      const row = buildSaleRow(syncEvent, sale, saleExportsBySaleId.get(String(sale.id)) || []);
+      const globalExport = exportLookup.get(makeSaleKey(syncEvent.store_id, sale.id));
+      const eventScopedExports = saleExportsBySaleId.get(String(sale.id)) || [];
+      const saleExportRows = globalExport ? [globalExport] : eventScopedExports;
+      const row = buildSaleRow(syncEvent, sale, saleExportRows);
       if (!isDateInRange(row.saleDate, dateRange)) {
         continue;
       }
