@@ -170,6 +170,65 @@ class EventDispatchService {
       staged: true,
     };
   }
+
+  async reconcileDayEndExports(syncEvent) {
+    if (syncEvent.event_type !== 'day_end.ready') {
+      throw new Error('Reconcile is only supported for day-end (OE order) batches');
+    }
+
+    const { existingExports, pendingSales } = await this.resolvePendingSales(syncEvent, DOCUMENT_TYPES.ORDER);
+
+    if (pendingSales.length === 0) {
+      return {
+        success: true,
+        found: true,
+        message: 'All sales in this batch already have an OE order export record.',
+        reconciledCount: 0,
+        skippedCount: existingExports.length,
+        orderNumber: existingExports[0]?.sage_document_number || null,
+        orderUniquifier: existingExports[0]?.sage_document_uniquifier || null,
+        orderReference: existingExports[0]?.sage_reference || syncEvent.idempotency_key || null,
+      };
+    }
+
+    const orderReference = syncEvent.idempotency_key;
+    const order = await this.sageOrdersService.findOrderByReference(orderReference);
+
+    if (!order || !order.OrderNumber) {
+      return {
+        success: false,
+        found: false,
+        message: `No matching Sage OE order was found for reference "${orderReference}". The batch may not have posted, or the order was created under a different reference.`,
+        reconciledCount: 0,
+        skippedCount: existingExports.length,
+        orderReference,
+      };
+    }
+
+    const dispatchResult = {
+      orderNumber: order.OrderNumber,
+      orderUniquifier: order.OrderUniquifier == null ? null : String(order.OrderUniquifier),
+      orderReference: order.OrderReference || orderReference,
+    };
+
+    const persisted = await this.syncSaleExportService.persistExports(
+      syncEvent,
+      pendingSales,
+      dispatchResult,
+      DOCUMENT_TYPES.ORDER
+    );
+
+    return {
+      success: true,
+      found: true,
+      message: `Backfilled ${persisted.length} sale(s) from Sage order ${dispatchResult.orderNumber}.`,
+      reconciledCount: persisted.length,
+      skippedCount: existingExports.length,
+      orderNumber: dispatchResult.orderNumber,
+      orderUniquifier: dispatchResult.orderUniquifier,
+      orderReference: dispatchResult.orderReference,
+    };
+  }
 }
 
 module.exports = EventDispatchService;

@@ -3,6 +3,7 @@ const { Op } = require('sequelize');
 
 const { reconAuth, requireReconRole } = require('../middleware/reconAuth');
 const { queueSyncEvent } = require('../services/syncEventQueueService');
+const EventDispatchService = require('../services/eventDispatchService');
 
 const router = express.Router();
 
@@ -1053,6 +1054,35 @@ router.post('/batches/:id/requeue', reconAuth, requireReconRole('admin'), async 
     jobId: job.id,
     event: serializeSyncEvent(syncEvent),
   });
+});
+
+router.post('/batches/:id/reconcile', reconAuth, requireReconRole('admin'), async (req, res) => {
+  const models = req.app.locals.models;
+  const syncEvent = await models.syncEvent.findByPk(req.params.id);
+
+  if (!syncEvent) {
+    return res.status(404).json({ message: 'Sync event not found' });
+  }
+
+  if (syncEvent.event_type !== SALES_EVENT_TYPE) {
+    return res.status(400).json({ message: 'Reconcile is only supported for day-end (OE order) batches' });
+  }
+
+  try {
+    const dispatchService = new EventDispatchService(models);
+    const result = await dispatchService.reconcileDayEndExports(syncEvent);
+
+    return res.status(result.success ? 200 : 422).json({
+      ...result,
+      eventId: syncEvent.id,
+      event: serializeSyncEvent(syncEvent),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to reconcile batch with Sage.',
+    });
+  }
 });
 
 module.exports = router;
