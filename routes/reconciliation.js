@@ -263,6 +263,19 @@ function makeSaleKey(storeId, saleId) {
   return `${storeId}:${String(saleId)}`;
 }
 
+// Globally-unique sale identity across all client POS backends.
+// store_id and sale.id are LOCAL to each client (many clients reuse store_id=1 and
+// overlapping sale ids), so they cannot identify a sale on their own. The receipt
+// number (e.g. RCP8212-1277) is prefixed with the store number and is globally
+// unique, so we key on it whenever it is present and only fall back to store+sale.
+function saleIdentityKey(storeId, receiptNumber, saleId) {
+  if (receiptNumber) {
+    return `rcp:${String(receiptNumber)}`;
+  }
+
+  return `sid:${storeId}:${String(saleId)}`;
+}
+
 function getComplianceSaleKey(syncEvent) {
   const sale = getComplianceSale(syncEvent);
   const saleId = sale.id || syncEvent.aggregate_id;
@@ -562,25 +575,47 @@ async function loadEventsWithExports(models, eventTypes, dateRange) {
 }
 
 async function loadExportsForSales(models, events) {
+  const receiptNumbers = new Set();
   const saleIdsByStore = new Map();
 
   for (const event of events) {
     const storeId = event.store_id;
-    if (storeId == null) {
-      continue;
-    }
-
-    const idSet = saleIdsByStore.get(storeId) || new Set();
     for (const sale of getSales(event)) {
-      if (sale && sale.id != null) {
+      if (!sale) {
+        continue;
+      }
+
+      if (sale.receipt_number) {
+        receiptNumbers.add(String(sale.receipt_number));
+      } else if (sale.id != null && storeId != null) {
+        const idSet = saleIdsByStore.get(storeId) || new Set();
         idSet.add(String(sale.id));
+        saleIdsByStore.set(storeId, idSet);
       }
     }
-    saleIdsByStore.set(storeId, idSet);
   }
 
   const lookup = new Map();
 
+  const addExportRow = (row) => {
+    const plain = row.toJSON ? row.toJSON() : row;
+    lookup.set(saleIdentityKey(plain.store_id, plain.receipt_number, plain.sale_id), plain);
+  };
+
+  // Primary match: by globally-unique receipt number (works across clients/branches).
+  if (receiptNumbers.size > 0) {
+    const exports = await models.syncSaleExport.findAll({
+      where: {
+        document_type: 'oe_order',
+        receipt_number: { [Op.in]: Array.from(receiptNumbers) },
+      },
+      order: [['id', 'ASC']],
+    });
+
+    exports.forEach(addExportRow);
+  }
+
+  // Fallback only for sales that never carried a receipt number.
   for (const [storeId, idSet] of saleIdsByStore.entries()) {
     const saleIds = Array.from(idSet);
     if (saleIds.length === 0) {
@@ -596,14 +631,12 @@ async function loadExportsForSales(models, events) {
       order: [['id', 'ASC']],
     });
 
-    for (const row of exports) {
-      const plain = row.toJSON ? row.toJSON() : row;
-      lookup.set(makeSaleKey(storeId, plain.sale_id), plain);
-    }
+    exports.forEach(addExportRow);
   }
 
   console.log('[reconciliation] loadExportsForSales loaded', {
-    storeCount: saleIdsByStore.size,
+    receiptCount: receiptNumbers.size,
+    fallbackStoreCount: saleIdsByStore.size,
     exportCount: lookup.size,
   });
 
@@ -662,6 +695,7 @@ router.get('/summary', reconAuth, async (req, res) => {
   const recentBatchRows = sortByIdDesc(events).slice(0, limit);
   const exportBundle = await loadExportsWithEvents(models, dateRange);
   const recentExports = sortByIdDesc(exportBundle.exports).slice(0, limit * 2);
+  const exportLookup = await loadExportsForSales(models, events);
 
   const branchPerformance = new Map();
   const terminalPerformance = new Map();
@@ -703,8 +737,6 @@ router.get('/summary', reconAuth, async (req, res) => {
   branchBucket.branchId = String(branchId);
   terminalBucket.branchId = String(branchId);
   terminalBucket.terminalId = String(terminalId);
-    const saleExports = (syncEvent.saleExports || []).filter((item) => item.document_type === 'oe_order');
-    const exportedSaleKeys = new Set(saleExports.map((item) => makeSaleKey(syncEvent.store_id, item.sale_id)));
 
     totalSalesValue += getTotalAmount(syncEvent);
     totalCreditNotesCount += getCreditNoteCount(syncEvent);
@@ -724,7 +756,7 @@ router.get('/summary', reconAuth, async (req, res) => {
     }
 
     for (const sale of getSales(syncEvent)) {
-      const saleKey = makeSaleKey(syncEvent.store_id, sale.id);
+      const saleKey = saleIdentityKey(syncEvent.store_id, sale.receipt_number, sale.id);
       const amount = roundCurrency(sale.total_amount);
 
       if (!uniqueSales.has(saleKey)) {
@@ -743,7 +775,7 @@ router.get('/summary', reconAuth, async (req, res) => {
       terminalBucket.salesCount += 1;
       terminalBucket.totalAmount = roundCurrency(terminalBucket.totalAmount + amount);
 
-      if (exportedSaleKeys.has(saleKey)) {
+      if (exportLookup.has(saleKey)) {
         postedSales.add(saleKey);
         branchBucket.postedSalesCount += 1;
         terminalBucket.postedSalesCount += 1;
@@ -761,8 +793,6 @@ router.get('/summary', reconAuth, async (req, res) => {
     const saleLookup = saleLookupFromPayload(sourceEvent);
     const sale = saleLookup.get(String(exportRow.sale_id)) || {};
 
-    incrementDocumentCounter(documentSummary, exportRow.document_type, 1);
-
     recentExportRows.push({
       id: exportRow.id,
       saleId: String(exportRow.sale_id),
@@ -777,6 +807,10 @@ router.get('/summary', reconAuth, async (req, res) => {
       paymentMethod: sale.payment_method || null,
       exportedAt: exportRow.exported_at,
     });
+  }
+
+  if (exportBundle.exports.length > 0) {
+    documentSummary.oe_order = exportBundle.exports.length;
   }
 
   const totalSalesCount = uniqueSales.size;
@@ -991,7 +1025,7 @@ router.get('/sales', reconAuth, async (req, res) => {
     const saleExportsBySaleId = groupExportsBySaleId(syncEvent.saleExports || []);
 
     for (const sale of getSales(syncEvent)) {
-      const globalExport = exportLookup.get(makeSaleKey(syncEvent.store_id, sale.id));
+      const globalExport = exportLookup.get(saleIdentityKey(syncEvent.store_id, sale.receipt_number, sale.id));
       const eventScopedExports = saleExportsBySaleId.get(String(sale.id)) || [];
       const saleExportRows = globalExport ? [globalExport] : eventScopedExports;
       const row = buildSaleRow(syncEvent, sale, saleExportRows);

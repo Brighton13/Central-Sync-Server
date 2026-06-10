@@ -88,6 +88,36 @@ async function ensureSyncSaleExportsSchema() {
   if (indexNames.has('uidx_sync_sale_exports_store_sale')) {
     await queryInterface.removeIndex('sync_sale_exports', 'uidx_sync_sale_exports_store_sale');
   }
+
+  // Re-key exports on the globally-unique receipt number instead of the local
+  // (store_id, sale_id) pair, which collides across client POS backends/branches.
+  if (indexNames.has('uidx_sync_sale_exports_store_sale_doc')) {
+    await queryInterface.removeIndex('sync_sale_exports', 'uidx_sync_sale_exports_store_sale_doc');
+  }
+
+  if (!indexNames.has('idx_sync_sale_exports_store_sale_doc')) {
+    await queryInterface.addIndex('sync_sale_exports', ['store_id', 'sale_id', 'document_type'], {
+      name: 'idx_sync_sale_exports_store_sale_doc',
+    });
+  }
+
+  if (!indexNames.has('uidx_sync_sale_exports_receipt_doc')) {
+    // Drop any pre-existing duplicate (receipt_number, document_type) rows, keeping the
+    // earliest, so the new unique index can be created safely. NULL receipts are ignored.
+    await models.sequelize.query(`
+      DELETE t1 FROM sync_sale_exports t1
+      INNER JOIN sync_sale_exports t2
+        ON t1.receipt_number = t2.receipt_number
+       AND t1.document_type = t2.document_type
+       AND t1.receipt_number IS NOT NULL
+       AND t1.id > t2.id
+    `);
+
+    await queryInterface.addIndex('sync_sale_exports', ['receipt_number', 'document_type'], {
+      name: 'uidx_sync_sale_exports_receipt_doc',
+      unique: true,
+    });
+  }
 }
 
 async function start() {

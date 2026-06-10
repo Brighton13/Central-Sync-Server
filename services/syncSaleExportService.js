@@ -5,6 +5,15 @@ class SyncSaleExportService {
     this.models = models;
   }
 
+  // Receipt numbers are globally unique across clients; store_id + sale_id are not.
+  buildIdentityKey(storeId, receiptNumber, saleId) {
+    if (receiptNumber) {
+      return `rcp:${String(receiptNumber)}`;
+    }
+
+    return `sid:${storeId}:${String(saleId)}`;
+  }
+
   resolveDispatchDocument(dispatchResult) {
     return {
       document_number: dispatchResult.documentNumber || dispatchResult.orderNumber || null,
@@ -13,18 +22,38 @@ class SyncSaleExportService {
     };
   }
 
-  async findExportsBySales(storeId, saleIds, documentType) {
-    if (!storeId || saleIds.length === 0) {
+  async findExportsForSales(storeId, sales, documentType) {
+    if (!sales || sales.length === 0) {
+      return [];
+    }
+
+    const receiptNumbers = [];
+    const fallbackSaleIds = [];
+
+    for (const sale of sales) {
+      if (sale.receipt_number) {
+        receiptNumbers.push(String(sale.receipt_number));
+      } else if (sale.id != null) {
+        fallbackSaleIds.push(String(sale.id));
+      }
+    }
+
+    const orConditions = [];
+    if (receiptNumbers.length > 0) {
+      orConditions.push({ receipt_number: { [Op.in]: receiptNumbers } });
+    }
+    if (fallbackSaleIds.length > 0 && storeId != null) {
+      orConditions.push({ store_id: storeId, sale_id: { [Op.in]: fallbackSaleIds } });
+    }
+
+    if (orConditions.length === 0) {
       return [];
     }
 
     return this.models.syncSaleExport.findAll({
       where: {
-        store_id: storeId,
         document_type: documentType,
-        sale_id: {
-          [Op.in]: saleIds.map((saleId) => String(saleId)),
-        },
+        [Op.or]: orConditions,
       },
       order: [['id', 'ASC']],
     });
@@ -84,12 +113,12 @@ class SyncSaleExportService {
         exported_at: new Date(),
       };
 
+      const where = document.receipt_number
+        ? { receipt_number: document.receipt_number, document_type: documentType }
+        : { store_id: syncEvent.store_id, sale_id: saleId, document_type: documentType };
+
       const [record] = await this.models.syncSaleExport.findOrCreate({
-        where: {
-          store_id: syncEvent.store_id,
-          sale_id: saleId,
-          document_type: documentType,
-        },
+        where,
         defaults,
       });
 

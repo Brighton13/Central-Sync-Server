@@ -74,10 +74,17 @@ class EventDispatchService {
   async resolvePendingSales(syncEvent, documentType) {
     const payload = syncEvent.payload || {};
     const sales = payload.sales || [];
-    const saleIds = sales.map((sale) => String(sale.id)).filter(Boolean);
-    const existingExports = await this.syncSaleExportService.findExportsBySales(syncEvent.store_id, saleIds, documentType);
-    const exportedSaleIds = new Set(existingExports.map((record) => String(record.sale_id)));
-    const pendingSales = sales.filter((sale) => !exportedSaleIds.has(String(sale.id)));
+    const existingExports = await this.syncSaleExportService.findExportsForSales(syncEvent.store_id, sales, documentType);
+    const exportedKeys = new Set(
+      existingExports.map((record) => this.syncSaleExportService.buildIdentityKey(
+        syncEvent.store_id,
+        record.receipt_number,
+        record.sale_id
+      ))
+    );
+    const pendingSales = sales.filter((sale) => !exportedKeys.has(
+      this.syncSaleExportService.buildIdentityKey(syncEvent.store_id, sale.receipt_number, sale.id)
+    ));
 
     return {
       payload,

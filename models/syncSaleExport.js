@@ -57,7 +57,11 @@ module.exports = (sequelize, DataTypes) => {
     timestamps: true,
     underscored: true,
     indexes: [
-      { name: 'uidx_sync_sale_exports_store_sale_doc', unique: true, fields: ['store_id', 'sale_id', 'document_type'] },
+      // Receipt numbers (e.g. RCP8212-1277) are prefixed with the store number and are
+      // globally unique across every client POS backend, whereas store_id + sale_id are
+      // local and collide across branches. The receipt is therefore the real export key.
+      { name: 'uidx_sync_sale_exports_receipt_doc', unique: true, fields: ['receipt_number', 'document_type'] },
+      { name: 'idx_sync_sale_exports_store_sale_doc', fields: ['store_id', 'sale_id', 'document_type'] },
       { name: 'idx_sync_sale_exports_sync_event_id', fields: ['sync_event_id'] },
       { name: 'idx_sync_sale_exports_day_end_key', fields: ['day_end_idempotency_key'] },
       { name: 'idx_sync_sale_exports_sage_document_number', fields: ['sage_document_number'] },
