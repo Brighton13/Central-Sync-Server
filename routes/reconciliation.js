@@ -1155,9 +1155,17 @@ router.post('/batches/:id/reconcile', reconAuth, requireReconRole('admin'), asyn
     return res.status(400).json({ message: 'Reconcile is only supported for day-end (OE order) batches' });
   }
 
+  const body = req.body || {};
+  const options = {
+    sageOrderNumber: body.sageOrderNumber ? String(body.sageOrderNumber).trim() : null,
+    sageOrderUniquifier: body.sageOrderUniquifier ? String(body.sageOrderUniquifier).trim() : null,
+    sageReference: body.sageReference ? String(body.sageReference).trim() : null,
+    repost: Boolean(body.repost),
+  };
+
   try {
     const dispatchService = new EventDispatchService(models);
-    const result = await dispatchService.reconcileDayEndExports(syncEvent);
+    const result = await dispatchService.reconcileDayEndExports(syncEvent, options);
 
     return res.status(result.success ? 200 : 422).json({
       ...result,
@@ -1170,6 +1178,99 @@ router.post('/batches/:id/reconcile', reconAuth, requireReconRole('admin'), asyn
       message: error.message || 'Failed to reconcile batch with Sage.',
     });
   }
+});
+
+// Scans completed day-end batches that never actually posted to Sage (their sales still
+// have no OE order export under their own receipt) and optionally re-posts them in bulk.
+router.post('/batches/repost-pending', reconAuth, requireReconRole('admin'), async (req, res) => {
+  const models = req.app.locals.models;
+  const body = req.body || {};
+  const dateRange = buildDateRange(body);
+  const dryRun = body.dryRun !== false;
+  const limit = Math.min(Math.max(Math.trunc(Number(body.limit) || 25), 1), 200);
+
+  const events = await models.syncEvent.findAll({
+    where: {
+      event_type: SALES_EVENT_TYPE,
+      received_at: buildRangeWhere(dateRange),
+    },
+    order: [['id', 'ASC']],
+  });
+
+  const dispatchService = new EventDispatchService(models);
+  const candidates = [];
+
+  for (const syncEvent of events) {
+    const { pendingSales, existingExports } = await dispatchService.resolvePendingSales(syncEvent, 'oe_order');
+    if (pendingSales.length === 0) {
+      continue;
+    }
+
+    candidates.push({
+      syncEvent,
+      eventId: syncEvent.id,
+      idempotencyKey: syncEvent.idempotency_key,
+      branchId: getBranchId(syncEvent) || 'Unassigned',
+      terminalId: getTerminalId(syncEvent) || 'Unassigned',
+      status: syncEvent.status,
+      salesCount: getSales(syncEvent).length,
+      pendingCount: pendingSales.length,
+      exportedCount: existingExports.length,
+    });
+  }
+
+  const describe = (candidate) => ({
+    eventId: candidate.eventId,
+    idempotencyKey: candidate.idempotencyKey,
+    branchId: candidate.branchId,
+    terminalId: candidate.terminalId,
+    status: candidate.status,
+    salesCount: candidate.salesCount,
+    pendingCount: candidate.pendingCount,
+    exportedCount: candidate.exportedCount,
+  });
+
+  if (dryRun) {
+    return res.json({
+      success: true,
+      dryRun: true,
+      filters: { startDate: dateRange.startDate, endDate: dateRange.endDate },
+      totalCandidates: candidates.length,
+      candidates: candidates.map(describe),
+    });
+  }
+
+  const toProcess = candidates.slice(0, limit);
+  const results = [];
+
+  for (const candidate of toProcess) {
+    try {
+      const result = await dispatchService.reconcileDayEndExports(candidate.syncEvent, { repost: true });
+      results.push({
+        ...describe(candidate),
+        success: result.success,
+        reconciledCount: result.reconciledCount || 0,
+        orderNumber: result.orderNumber || null,
+        message: result.message || null,
+      });
+    } catch (error) {
+      results.push({
+        ...describe(candidate),
+        success: false,
+        message: error.response?.data?.message || error.message || 'Re-post failed',
+      });
+    }
+  }
+
+  return res.json({
+    success: true,
+    dryRun: false,
+    filters: { startDate: dateRange.startDate, endDate: dateRange.endDate },
+    totalCandidates: candidates.length,
+    processed: results.length,
+    remaining: Math.max(candidates.length - results.length, 0),
+    results,
+  });
 });
 
 module.exports = router;

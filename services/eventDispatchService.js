@@ -178,7 +178,7 @@ class EventDispatchService {
     };
   }
 
-  async reconcileDayEndExports(syncEvent) {
+  async reconcileDayEndExports(syncEvent, options = {}) {
     if (syncEvent.event_type !== 'day_end.ready') {
       throw new Error('Reconcile is only supported for day-end (OE order) batches');
     }
@@ -199,16 +199,82 @@ class EventDispatchService {
     }
 
     const orderReference = syncEvent.idempotency_key;
+
+    // Correction path 1: operator supplies the Sage order number directly (looked up
+    // in Sage), used when the order exists under a different/variant reference.
+    if (options.sageOrderNumber) {
+      let orderEntity = null;
+      try {
+        orderEntity = await this.sageOrdersService.findOrderByNumber(options.sageOrderNumber);
+      } catch (lookupError) {
+        orderEntity = null;
+      }
+
+      const verified = Boolean(orderEntity && orderEntity.OrderNumber);
+      const dispatchResult = {
+        orderNumber: verified ? orderEntity.OrderNumber : options.sageOrderNumber,
+        orderUniquifier: verified
+          ? (orderEntity.OrderUniquifier == null ? null : String(orderEntity.OrderUniquifier))
+          : (options.sageOrderUniquifier || null),
+        orderReference: verified
+          ? (orderEntity.OrderReference || options.sageReference || orderReference)
+          : (options.sageReference || orderReference),
+      };
+
+      const persisted = await this.syncSaleExportService.persistExports(
+        syncEvent,
+        pendingSales,
+        dispatchResult,
+        DOCUMENT_TYPES.ORDER
+      );
+
+      return {
+        success: true,
+        found: true,
+        manual: true,
+        verified,
+        message: verified
+          ? `Linked ${persisted.length} sale(s) to Sage order ${dispatchResult.orderNumber}.`
+          : `Linked ${persisted.length} sale(s) to order ${dispatchResult.orderNumber} as provided (could not verify it in Sage).`,
+        reconciledCount: persisted.length,
+        skippedCount: existingExports.length,
+        orderNumber: dispatchResult.orderNumber,
+        orderUniquifier: dispatchResult.orderUniquifier,
+        orderReference: dispatchResult.orderReference,
+      };
+    }
+
+    // Correction path 2: re-post the batch to Sage (creates the order if it never posted).
+    if (options.repost) {
+      const result = await this.dispatch(syncEvent);
+      return {
+        success: true,
+        found: true,
+        reposted: true,
+        message: result.message
+          ? `Re-posted batch to Sage: ${result.message}`
+          : `Re-posted batch to Sage as order ${result.orderNumber || 'created'}.`,
+        reconciledCount: result.persistedSalesCount || 0,
+        skippedCount: result.skippedSalesCount || existingExports.length,
+        orderNumber: result.orderNumber || null,
+        orderUniquifier: result.orderUniquifier || null,
+        orderReference: result.orderReference || orderReference,
+      };
+    }
+
+    // Default path: auto lookup by exact OrderReference.
     const order = await this.sageOrdersService.findOrderByReference(orderReference);
 
     if (!order || !order.OrderNumber) {
       return {
         success: false,
         found: false,
-        message: `No matching Sage OE order was found for reference "${orderReference}". The batch may not have posted, or the order was created under a different reference.`,
+        message: `No matching Sage OE order was found for reference "${orderReference}". Either re-post the batch (if it never posted) or link it to an existing Sage order number.`,
         reconciledCount: 0,
         skippedCount: existingExports.length,
         orderReference,
+        canRepost: true,
+        canLinkManually: true,
       };
     }
 

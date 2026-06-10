@@ -200,6 +200,24 @@ class SageOrdersService {
     return this.extractOrderEntity(response.data);
   }
 
+  async findOrderByNumber(orderNumber) {
+    if (!orderNumber) {
+      return null;
+    }
+
+    const { baseUrl, headers } = this.getAuthConfig();
+    const response = await axios.get(`${baseUrl}/OE/OEOrders`, {
+      headers,
+      params: {
+        $filter: `OrderNumber eq '${this.escapeODataString(orderNumber)}'`,
+        $top: 1,
+      },
+      timeout: this.timeout,
+    });
+
+    return this.extractOrderEntity(response.data);
+  }
+
   async createConsolidatedOrder(salesDataArray, user, date, terminalId, options = {}) {
     const { baseUrl, headers } = this.getAuthConfig();
     const order = this.buildConsolidatedOrder(salesDataArray, user, date, terminalId, options.orderReference, options);
