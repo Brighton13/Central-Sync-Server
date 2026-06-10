@@ -204,7 +204,7 @@ class SageOrdersService {
     const { baseUrl, headers } = this.getAuthConfig();
     const order = this.buildConsolidatedOrder(salesDataArray, user, date, terminalId, options.orderReference, options);
 
-    if (options.reconcileExisting && options.orderReference) {
+    if (options.orderReference) {
       const existingOrder = await this.findOrderByReference(options.orderReference);
       if (existingOrder) {
         return this.normalizeOrderResponse(existingOrder, 200, salesDataArray, order, terminalId, {

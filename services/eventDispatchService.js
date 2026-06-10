@@ -152,7 +152,6 @@ class EventDispatchService {
         {
           branchId,
           orderReference: syncEvent.idempotency_key,
-          reconcileExisting: (syncEvent.retry_count || 0) > 0,
         }
       );
 

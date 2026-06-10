@@ -8,10 +8,11 @@ const router = express.Router();
 
 const RELEVANT_EVENT_TYPES = ['day_end.ready', 'credit_note.created'];
 const SALES_EVENT_TYPE = 'day_end.ready';
-const ZRA_COMPLIANCE_EVENT_TYPE = 'sale.created';
+const ZRA_COMPLIANCE_EVENT_TYPES = ['sale.created', 'sale.updated'];
 const EVENT_TYPE_LABELS = {
   'day_end.ready': 'OE Order Batch',
   'sale.created': 'Sale Created',
+  'sale.updated': 'Sale Updated',
   'credit_note.created': 'Credit Note Return',
 };
 const STATUS_BUCKETS = {
@@ -259,6 +260,35 @@ function getCreditNoteTotal(syncEvent) {
 
 function makeSaleKey(storeId, saleId) {
   return `${storeId}:${String(saleId)}`;
+}
+
+function getComplianceSaleKey(syncEvent) {
+  const sale = getComplianceSale(syncEvent);
+  const saleId = sale.id || syncEvent.aggregate_id;
+
+  if (!saleId) {
+    return null;
+  }
+
+  return makeSaleKey(syncEvent.store_id, saleId);
+}
+
+function selectLatestComplianceEvents(events) {
+  const latestBySale = new Map();
+
+  for (const syncEvent of events) {
+    const saleKey = getComplianceSaleKey(syncEvent);
+    if (!saleKey) {
+      continue;
+    }
+
+    const existingEvent = latestBySale.get(saleKey);
+    if (!existingEvent || syncEvent.id > existingEvent.id) {
+      latestBySale.set(saleKey, syncEvent);
+    }
+  }
+
+  return Array.from(latestBySale.values());
 }
 
 function toStatusBucket(status) {
@@ -755,7 +785,9 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
     dateRange,
     limit,
   });
-  const events = await loadEventsWithExports(models, ZRA_COMPLIANCE_EVENT_TYPE, dateRange);
+  const events = selectLatestComplianceEvents(
+    await loadEventsWithExports(models, ZRA_COMPLIANCE_EVENT_TYPES, dateRange)
+  );
 
   const terminalCompliance = new Map();
   const branchCompliance = new Map();
