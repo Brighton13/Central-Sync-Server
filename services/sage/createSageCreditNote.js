@@ -260,6 +260,161 @@ class SageCreditNoteService {
       throw error;
     }
   }
+
+  // Builds a single consolidated OE credit-note document containing the line items of every
+  // credit note in the day's batch. Mirrors SageOrdersService.buildConsolidatedOrder so the
+  // batch posting behaves exactly like the consolidated sales day-end order.
+  buildConsolidatedCreditNote(creditNotes, user, date, orderReference, options = {}) {
+    const orderDate = date ? new Date(date).toISOString() : new Date().toISOString();
+    let detailIndex = 0;
+    const orderDetails = [];
+
+    for (const creditNote of creditNotes) {
+      const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || `CN-${creditNote?.id}`;
+
+      for (const rawItem of (creditNote.items || [])) {
+        const item = this.normalizeItem(rawItem);
+        orderDetails.push({
+          LineNumber: (detailIndex + 1) * 32,
+          LineType: 'Item',
+          Item: item.code,
+          Description: `${creditNoteRef} - ${item.description}`,
+          Category: user?.store?.store_customer_number || '',
+          Location: user?.store?.store_number || '',
+          StockItem: true,
+          QuantityOrdered: item.quantity,
+          OrderUnitOfMeasure: 'EACH',
+          OrderUnitConversion: 1,
+          OrderUnitPrice: this.to4(item.unitPrice),
+          PriceOverride: true,
+          PricingUnitOfMeasure: 'EACH',
+          PricingUnitPrice: this.to4(item.unitPrice),
+          PricingUnitConversion: 1,
+          DetailNumber: detailIndex + 1,
+          TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
+          TaxClass1: 1,
+          TaxIncluded1: true,
+          UpdateOperation: 'Unspecified',
+        });
+        detailIndex += 1;
+      }
+    }
+
+    const totalFromCreditNotes = creditNotes.reduce((sum, creditNote) => sum + (Number(creditNote?.total_amount) || 0), 0);
+    const fallbackFromLines = orderDetails.reduce((sum, line) => sum + (Number(line.OrderUnitPrice) * Number(line.QuantityOrdered)), 0);
+    const orderTotal = this.to4(totalFromCreditNotes || fallbackFromLines);
+    const orderDescription = ['CN BATCH', options.branchId || '000', options.terminalId || '000', orderDate.slice(0, 10)].join(' ');
+
+    return {
+      OrderUniquifier: 0,
+      OrderNumber: '*** NEW ***',
+      OrderReference: orderReference || '',
+      CustomerNumber: user?.store?.store_customer_number || '1101',
+      CustomerGroupCode: user?.store?.currency || 'ZMW',
+      ShipToName: user?.store?.store_location || 'POS Customer',
+      ShipToAddressLine1: '',
+      ShipToCity: '',
+      OrderDescription: orderDescription,
+      CustomerDiscountLevel: 'Base',
+      DefaultPriceListCode: user?.store?.price_list_code || '01',
+      TermsCode: user?.store?.terms_code || 'COD',
+      OrderType: 'Active',
+      OrderDate: orderDate,
+      ExpectedShipDate: orderDate,
+      OrderFiscalYear: String(new Date(orderDate).getUTCFullYear()),
+      OrderFiscalPeriod: `Num${new Date(orderDate).getUTCMonth() + 1}`,
+      DefaultLocationCode: user?.store?.store_number || '',
+      OnHold: false,
+      OrderHomeCurrency: user?.store?.currency || 'ZMW',
+      OrderRateType: 'SP',
+      OrderSourceCurrency: user?.store?.currency || 'ZMW',
+      OrderRateDate: orderDate,
+      OrderRate: 1,
+      OrderRateDateMatching: 3,
+      OrderRateOperator: 1,
+      OrderRateOverrideFlag: false,
+      TaxGroup: user?.store?.store_tax_group || 'VATZMW',
+      TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
+      TaxClass1: 1,
+      OrderCompleted: 'IncompleteNotIncluded',
+      PostInvoice: false,
+      TaxReportingTRCurrency: user?.store?.currency || 'ZMW',
+      TRRateType: 'SP',
+      TRRateDate: orderDate,
+      TRRate: 1,
+      TRRateDateMatching: 1,
+      TRRateOperator: 1,
+      OrderDetails: orderDetails,
+      OrderTotal: orderTotal,
+      OrderInclTaxTotal: orderTotal,
+      NumberOfLinesOnOrder: orderDetails.length,
+      UpdateOperation: 'Unspecified',
+    };
+  }
+
+  // Posts the consolidated daily credit-note batch as one OE credit-note document. Idempotent:
+  // if a document already exists for this batch reference it is reused instead of duplicated.
+  async createConsolidatedCreditNoteReturn(creditNotes, user, date, options = {}) {
+    const { baseUrl, headers } = this.getAuthConfig();
+    const orderReference = options.orderReference;
+    const order = this.buildConsolidatedCreditNote(creditNotes, user, date, orderReference, options);
+
+    if (orderReference) {
+      const existingOrder = await this.findExistingCreditNoteOrder(orderReference);
+      if (existingOrder) {
+        return {
+          success: true,
+          status: 200,
+          data: existingOrder,
+          responseBody: existingOrder,
+          sageResponse: existingOrder,
+          documentNumber: existingOrder.OrderNumber || null,
+          documentUniquifier: existingOrder.OrderUniquifier == null ? null : String(existingOrder.OrderUniquifier),
+          documentReference: existingOrder.OrderReference || orderReference,
+          existingDocument: true,
+          creditNotesProcessed: creditNotes.length,
+        };
+      }
+    }
+
+    console.log('[SageCreditNoteService] createConsolidatedCreditNoteReturn sending document:', {
+      orderReference,
+      url: `${baseUrl}/OE/OEOrders`,
+      OrderTotal: order.OrderTotal,
+      NumberOfLinesOnOrder: order.NumberOfLinesOnOrder,
+      creditNotes: creditNotes.length,
+      timeout: this.timeout,
+    });
+
+    try {
+      const response = await axios.post(`${baseUrl}/OE/OEOrders`, order, {
+        headers,
+        timeout: this.timeout,
+      });
+
+      console.log('[SageCreditNoteService] createConsolidatedCreditNoteReturn response status:', response.status);
+      return {
+        success: true,
+        status: response.status,
+        data: response.data,
+        responseBody: response.data,
+        sageResponse: response.data,
+        documentNumber: response.data?.OrderNumber || null,
+        documentUniquifier: response.data?.OrderUniquifier == null ? null : String(response.data.OrderUniquifier),
+        documentReference: response.data?.OrderReference || orderReference,
+        existingDocument: false,
+        creditNotesProcessed: creditNotes.length,
+      };
+    } catch (error) {
+      console.error('[SageCreditNoteService] createConsolidatedCreditNoteReturn error:', {
+        orderReference,
+        message: error.message,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      throw error;
+    }
+  }
 }
 
 module.exports = SageCreditNoteService;

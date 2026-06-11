@@ -8,14 +8,16 @@ const EventDispatchService = require('../services/eventDispatchService');
 
 const router = express.Router();
 
-const RELEVANT_EVENT_TYPES = ['day_end.ready', 'credit_note.created'];
+const RELEVANT_EVENT_TYPES = ['day_end.ready', 'credit_note.created', 'credit_note_batch.ready'];
 const SALES_EVENT_TYPE = 'day_end.ready';
+const CREDIT_NOTE_BATCH_EVENT_TYPE = 'credit_note_batch.ready';
 const ZRA_COMPLIANCE_EVENT_TYPES = ['sale.created', 'sale.updated'];
 const EVENT_TYPE_LABELS = {
   'day_end.ready': 'OE Order Batch',
   'sale.created': 'Sale Created',
   'sale.updated': 'Sale Updated',
   'credit_note.created': 'Credit Note Return',
+  'credit_note_batch.ready': 'Credit Note Batch',
 };
 const STATUS_BUCKETS = {
   completed: 'completed',
@@ -241,13 +243,28 @@ function getTransactionCount(syncEvent) {
     return Number(payload.sales_count);
   }
 
-  return getSales(syncEvent).length;
+  const salesCount = getSales(syncEvent).length;
+  if (salesCount > 0) {
+    return salesCount;
+  }
+
+  // Credit-note-only batches (credit_note_batch.ready) carry no sales; report the
+  // credit-note count so the batch register shows the real transaction volume.
+  if (Number.isFinite(Number(payload.credit_notes_count))) {
+    return Number(payload.credit_notes_count);
+  }
+
+  return getCreditNotes(syncEvent).length;
 }
 
 function getTotalAmount(syncEvent) {
-  return roundCurrency(
-    getSales(syncEvent).reduce((sum, sale) => sum + parseNumber(sale.total_amount), 0)
-  );
+  const sales = getSales(syncEvent);
+  if (sales.length > 0) {
+    return roundCurrency(sales.reduce((sum, sale) => sum + parseNumber(sale.total_amount), 0));
+  }
+
+  // Credit-note-only batches: report the credit-note total instead of zero.
+  return getCreditNoteTotal(syncEvent);
 }
 
 function getCreditNoteCount(syncEvent) {
@@ -540,6 +557,66 @@ function buildSaleRow(syncEvent, sale, saleExportRows) {
   };
 }
 
+function buildCreditNotePendingReason(syncEvent, posted) {
+  if (posted) {
+    return 'Posted to Sage successfully as a credit-note document.';
+  }
+
+  if (syncEvent.last_error) {
+    return syncEvent.last_error;
+  }
+
+  switch (syncEvent.status) {
+    case 'failed':
+    case 'dead_letter':
+      return 'The credit-note batch failed before this credit note could be posted to Sage.';
+    case 'processing':
+      return 'The credit-note batch is currently being processed.';
+    case 'queued':
+    case 'received':
+      return 'The credit-note batch is queued and waiting to be processed.';
+    case 'completed':
+      return 'The batch completed, but no credit-note export record was found for this credit note.';
+    default:
+      return 'This credit note has not been posted to Sage yet.';
+  }
+}
+
+function buildCreditNoteRow(syncEvent, creditNote, creditNoteExportRows) {
+  const document = creditNoteExportRows.find((row) => row.document_type === 'oe_credit_note') || null;
+  const posted = Boolean(document);
+
+  return {
+    id: `${syncEvent.id}:${creditNote.id}`,
+    syncEventId: syncEvent.id,
+    creditNoteId: String(creditNote.id),
+    receiptNumber: creditNote.receipt_number || null,
+    originalSaleId: creditNote.original_sale_id != null ? String(creditNote.original_sale_id) : null,
+    branchId: getBranchId(syncEvent) || 'Unassigned',
+    terminalId: getTerminalId(syncEvent) || 'Unassigned',
+    storeId: syncEvent.store_id,
+    creditNoteDate: creditNote.credit_note_date || creditNote.date || getPayload(syncEvent).date || syncEvent.received_at,
+    batchReceivedAt: syncEvent.received_at,
+    subtotal: roundCurrency(creditNote.subtotal),
+    taxAmount: roundCurrency(creditNote.tax_amount),
+    amount: roundCurrency(creditNote.total_amount),
+    paymentMethod: creditNote.payment_method || null,
+    reason: creditNote.reason || null,
+    customerName: creditNote.customer?.legal_name || creditNote.customer?.name || null,
+    batchStatus: syncEvent.status,
+    batchStatusBucket: toStatusBucket(syncEvent.status),
+    sageDocumentNumber: document?.sage_document_number || null,
+    sageReference: document?.sage_reference || null,
+    postedToSage: posted,
+    pendingReason: buildCreditNotePendingReason(syncEvent, posted),
+    batchProcessedAt: syncEvent.processed_at,
+    batchLastAttemptAt: syncEvent.last_attempt_at,
+    batchRetryCount: syncEvent.retry_count,
+    batchIdempotencyKey: syncEvent.idempotency_key,
+    batchLastError: syncEvent.last_error || null,
+  };
+}
+
 async function loadEventsWithExports(models, eventTypes, dateRange) {
   console.log('[reconciliation] loadEventsWithExports start', {
     eventTypes,
@@ -644,6 +721,68 @@ async function loadExportsForSales(models, events) {
   return lookup;
 }
 
+// Mirrors loadExportsForSales but for credit notes: matches `oe_credit_note` export rows by
+// the globally-unique credit-note receipt number (with store+id fallback for legacy rows).
+async function loadCreditNoteExports(models, events) {
+  const receiptNumbers = new Set();
+  const idsByStore = new Map();
+
+  for (const event of events) {
+    const storeId = event.store_id;
+    for (const creditNote of getCreditNotes(event)) {
+      if (!creditNote) {
+        continue;
+      }
+
+      if (creditNote.receipt_number) {
+        receiptNumbers.add(String(creditNote.receipt_number));
+      } else if (creditNote.id != null && storeId != null) {
+        const idSet = idsByStore.get(storeId) || new Set();
+        idSet.add(String(creditNote.id));
+        idsByStore.set(storeId, idSet);
+      }
+    }
+  }
+
+  const lookup = new Map();
+  const addExportRow = (row) => {
+    const plain = row.toJSON ? row.toJSON() : row;
+    lookup.set(saleIdentityKey(plain.store_id, plain.receipt_number, plain.sale_id), plain);
+  };
+
+  if (receiptNumbers.size > 0) {
+    const exports = await models.syncSaleExport.findAll({
+      where: {
+        document_type: 'oe_credit_note',
+        receipt_number: { [Op.in]: Array.from(receiptNumbers) },
+      },
+      order: [['id', 'ASC']],
+    });
+
+    exports.forEach(addExportRow);
+  }
+
+  for (const [storeId, idSet] of idsByStore.entries()) {
+    const ids = Array.from(idSet);
+    if (ids.length === 0) {
+      continue;
+    }
+
+    const exports = await models.syncSaleExport.findAll({
+      where: {
+        store_id: storeId,
+        document_type: 'oe_credit_note',
+        sale_id: { [Op.in]: ids },
+      },
+      order: [['id', 'ASC']],
+    });
+
+    exports.forEach(addExportRow);
+  }
+
+  return lookup;
+}
+
 async function loadExportsWithEvents(models, dateRange) {
   console.log('[reconciliation] loadExportsWithEvents start', {
     startDate: dateRange.startDate,
@@ -702,6 +841,7 @@ router.get('/summary', reconAuth, async (req, res) => {
   const terminalPerformance = new Map();
   const documentSummary = {};
   const uniqueSales = new Map();
+  const uniqueCreditNotes = new Map();
   const postedSales = new Set();
   const recentExportRows = [];
 
@@ -710,8 +850,6 @@ router.get('/summary', reconAuth, async (req, res) => {
   let pendingBatches = 0;
   let failedBatches = 0;
   let totalSalesValue = 0;
-  let totalCreditNotesCount = 0;
-  let totalCreditNotesValue = 0;
 
   for (const syncEvent of events) {
     const statusBucket = toStatusBucket(syncEvent.status);
@@ -727,6 +865,17 @@ router.get('/summary', reconAuth, async (req, res) => {
 
     incrementDocumentCounter(documentSummary, syncEvent.event_type, getTransactionCount(syncEvent));
 
+    // Credit-note totals come from the dedicated credit-note batches so the dashboard card,
+    // the batch register, and the credit-note ledger all read from the same source. Deduped
+    // by globally-unique receipt number so a credit note re-queued in a later batch is counted once.
+    if (syncEvent.event_type === CREDIT_NOTE_BATCH_EVENT_TYPE) {
+      for (const creditNote of getCreditNotes(syncEvent)) {
+        const creditNoteKey = saleIdentityKey(syncEvent.store_id, creditNote.receipt_number, creditNote.id);
+        uniqueCreditNotes.set(creditNoteKey, roundCurrency(creditNote.total_amount));
+      }
+      continue;
+    }
+
     if (syncEvent.event_type !== SALES_EVENT_TYPE) {
       continue;
     }
@@ -740,8 +889,6 @@ router.get('/summary', reconAuth, async (req, res) => {
   terminalBucket.terminalId = String(terminalId);
 
     totalSalesValue += getTotalAmount(syncEvent);
-    totalCreditNotesCount += getCreditNoteCount(syncEvent);
-    totalCreditNotesValue += getCreditNoteTotal(syncEvent);
     branchBucket.batches += 1;
     terminalBucket.batches += 1;
 
@@ -817,6 +964,9 @@ router.get('/summary', reconAuth, async (req, res) => {
   const totalSalesCount = uniqueSales.size;
   const postedSalesCount = postedSales.size;
   const pendingSalesCount = Math.max(totalSalesCount - postedSalesCount, 0);
+  const totalCreditNotesCount = uniqueCreditNotes.size;
+  const totalCreditNotesValue = Array.from(uniqueCreditNotes.values())
+    .reduce((sum, amount) => sum + parseNumber(amount), 0);
 
   console.log('[reconciliation] /summary result', {
     totalBatches,
@@ -1323,6 +1473,279 @@ router.get('/sales/export', reconAuth, async (req, res) => {
   }
 });
 
+const CREDIT_NOTE_EXPORT_COLUMNS = [
+  { header: 'Credit Note Date', key: 'creditNoteDate', width: 20 },
+  { header: 'Branch', key: 'branchId', width: 12 },
+  { header: 'Terminal', key: 'terminalId', width: 12 },
+  { header: 'Receipt #', key: 'receiptNumber', width: 22 },
+  { header: 'Original Sale #', key: 'originalSaleId', width: 16 },
+  { header: 'Customer', key: 'customer', width: 24 },
+  { header: 'Reason', key: 'reason', width: 28 },
+  { header: 'Payment Method', key: 'paymentMethod', width: 16 },
+  { header: 'Subtotal', key: 'subtotal', width: 14, money: true },
+  { header: 'Tax', key: 'tax', width: 14, money: true },
+  { header: 'Total', key: 'total', width: 14, money: true },
+  { header: 'Posted to Sage', key: 'postedToSageLabel', width: 14 },
+  { header: 'Sage Doc #', key: 'sageDocumentNumber', width: 18 },
+];
+
+// Builds one finance-facing credit-note row. Reuses buildCreditNoteRow so the branch/
+// terminal/date/Sage values match the dashboard exactly, and adds the financial breakdown.
+function buildCreditNoteExportRow(syncEvent, creditNote, creditNoteExportRows) {
+  const base = buildCreditNoteRow(syncEvent, creditNote, creditNoteExportRows);
+  return {
+    creditNoteDate: base.creditNoteDate,
+    branchId: base.branchId,
+    terminalId: base.terminalId,
+    storeId: base.storeId,
+    receiptNumber: base.receiptNumber,
+    originalSaleId: base.originalSaleId,
+    customer: base.customerName,
+    reason: base.reason,
+    paymentMethod: base.paymentMethod,
+    subtotal: roundCurrency(creditNote.subtotal),
+    tax: roundCurrency(creditNote.tax_amount),
+    total: roundCurrency(creditNote.total_amount),
+    postedToSage: base.postedToSage,
+    sageDocumentNumber: base.sageDocumentNumber,
+  };
+}
+
+// Collects deduped credit-note rows for the finance export (latest batch wins), mirroring
+// collectSalesExportRows so a credit note is never double-counted in finance totals.
+function collectCreditNotesExportRows(events, exportLookup, filters, dateRange) {
+  const rowsByKey = new Map();
+  const orderedEvents = [...events].sort((left, right) => left.id - right.id);
+
+  for (const syncEvent of orderedEvents) {
+    if (!eventMatchesFilters(syncEvent, filters)) {
+      continue;
+    }
+
+    const exportsBySaleId = groupExportsBySaleId(syncEvent.saleExports || []);
+
+    for (const creditNote of getCreditNotes(syncEvent)) {
+      const key = saleIdentityKey(syncEvent.store_id, creditNote.receipt_number, creditNote.id);
+      const globalExport = exportLookup.get(key);
+      const eventScopedExports = exportsBySaleId.get(String(creditNote.id)) || [];
+      const creditNoteExportRows = globalExport ? [globalExport] : eventScopedExports;
+      const row = buildCreditNoteExportRow(syncEvent, creditNote, creditNoteExportRows);
+
+      if (!isDateInRange(row.creditNoteDate, dateRange)) {
+        continue;
+      }
+
+      rowsByKey.set(key, row);
+    }
+  }
+
+  return Array.from(rowsByKey.values());
+}
+
+function addCreditNotesDetailSheet(workbook, sheetName, rows) {
+  const sheet = workbook.addWorksheet(sheetName);
+  sheet.columns = CREDIT_NOTE_EXPORT_COLUMNS.map((column) => ({
+    header: column.header,
+    key: column.key,
+    width: column.width,
+  }));
+  styleHeaderRow(sheet.getRow(1));
+
+  for (const row of rows) {
+    sheet.addRow({
+      ...row,
+      creditNoteDate: formatExcelDate(row.creditNoteDate),
+      postedToSageLabel: row.postedToSage ? 'Yes' : 'No',
+    });
+  }
+
+  CREDIT_NOTE_EXPORT_COLUMNS.forEach((column, index) => {
+    if (column.money) {
+      sheet.getColumn(index + 1).numFmt = CURRENCY_FORMAT;
+    }
+  });
+  sheet.getColumn(1).numFmt = 'yyyy-mm-dd hh:mm';
+
+  const totals = rows.reduce(
+    (acc, row) => ({
+      subtotal: acc.subtotal + parseNumber(row.subtotal),
+      tax: acc.tax + parseNumber(row.tax),
+      total: acc.total + parseNumber(row.total),
+    }),
+    { subtotal: 0, tax: 0, total: 0 }
+  );
+
+  const totalRow = sheet.addRow({
+    customer: `TOTAL (${rows.length} credit notes)`,
+    subtotal: roundCurrency(totals.subtotal),
+    tax: roundCurrency(totals.tax),
+    total: roundCurrency(totals.total),
+  });
+  totalRow.font = { bold: true };
+  totalRow.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE5E7EB' } };
+  });
+
+  sheet.views = [{ state: 'frozen', ySplit: 1 }];
+  sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: CREDIT_NOTE_EXPORT_COLUMNS.length } };
+  return sheet;
+}
+
+function addCreditNotesSummarySheet(workbook, rowsByBranch, dateRange, filters) {
+  const sheet = workbook.addWorksheet('Summary by Branch');
+  sheet.mergeCells('A1:G1');
+  sheet.getCell('A1').value = 'Credit Note Report by Branch';
+  sheet.getCell('A1').font = { bold: true, size: 16 };
+
+  sheet.mergeCells('A2:G2');
+  sheet.getCell('A2').value =
+    `Period: ${dateRange.startDate.slice(0, 10)} to ${dateRange.endDate.slice(0, 10)}`
+    + (filters.branchId ? `  |  Branch: ${filters.branchId}` : '')
+    + (filters.terminalId ? `  |  Terminal: ${filters.terminalId}` : '');
+  sheet.getCell('A2').font = { italic: true, color: { argb: 'FF6B7280' } };
+
+  sheet.mergeCells('A3:G3');
+  sheet.getCell('A3').value = `Generated: ${new Date().toISOString()}`;
+  sheet.getCell('A3').font = { italic: true, color: { argb: 'FF6B7280' } };
+
+  const headerRowIndex = 5;
+  const headers = ['Branch', 'Credit Notes', 'Subtotal', 'Tax', 'Total', 'Posted to Sage', 'Pending'];
+  const headerRow = sheet.getRow(headerRowIndex);
+  headers.forEach((header, index) => {
+    headerRow.getCell(index + 1).value = header;
+  });
+  styleHeaderRow(headerRow);
+
+  sheet.columns = [
+    { width: 14 },
+    { width: 14 },
+    { width: 16 },
+    { width: 16 },
+    { width: 16 },
+    { width: 16 },
+    { width: 12 },
+  ];
+
+  const grand = { count: 0, subtotal: 0, tax: 0, total: 0, posted: 0, pending: 0 };
+  const sortedBranches = Array.from(rowsByBranch.entries()).sort((left, right) => left[0].localeCompare(right[0]));
+
+  let cursor = headerRowIndex + 1;
+  for (const [branchId, rows] of sortedBranches) {
+    const agg = rows.reduce(
+      (acc, row) => ({
+        subtotal: acc.subtotal + parseNumber(row.subtotal),
+        tax: acc.tax + parseNumber(row.tax),
+        total: acc.total + parseNumber(row.total),
+        posted: acc.posted + (row.postedToSage ? 1 : 0),
+      }),
+      { subtotal: 0, tax: 0, total: 0, posted: 0 }
+    );
+    const pending = rows.length - agg.posted;
+
+    const row = sheet.getRow(cursor);
+    row.getCell(1).value = branchId;
+    row.getCell(2).value = rows.length;
+    row.getCell(3).value = roundCurrency(agg.subtotal);
+    row.getCell(4).value = roundCurrency(agg.tax);
+    row.getCell(5).value = roundCurrency(agg.total);
+    row.getCell(6).value = agg.posted;
+    row.getCell(7).value = pending;
+    cursor += 1;
+
+    grand.count += rows.length;
+    grand.subtotal += agg.subtotal;
+    grand.tax += agg.tax;
+    grand.total += agg.total;
+    grand.posted += agg.posted;
+    grand.pending += pending;
+  }
+
+  const totalRow = sheet.getRow(cursor);
+  totalRow.getCell(1).value = 'ALL BRANCHES';
+  totalRow.getCell(2).value = grand.count;
+  totalRow.getCell(3).value = roundCurrency(grand.subtotal);
+  totalRow.getCell(4).value = roundCurrency(grand.tax);
+  totalRow.getCell(5).value = roundCurrency(grand.total);
+  totalRow.getCell(6).value = grand.posted;
+  totalRow.getCell(7).value = grand.pending;
+  totalRow.font = { bold: true };
+  totalRow.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE5E7EB' } };
+  });
+
+  [3, 4, 5].forEach((columnIndex) => {
+    sheet.getColumn(columnIndex).numFmt = CURRENCY_FORMAT;
+  });
+
+  return sheet;
+}
+
+router.get('/credit-notes/export', reconAuth, async (req, res) => {
+  const models = req.app.locals.models;
+  const dateRange = buildDateRange(req.query);
+  const filters = {
+    branchId: req.query.branchId || '',
+    terminalId: req.query.terminalId || '',
+  };
+  console.log('[reconciliation] /credit-notes/export request', { query: req.query, dateRange, filters });
+
+  try {
+    const events = await loadEventsWithExports(models, CREDIT_NOTE_BATCH_EVENT_TYPE, dateRange);
+    const exportLookup = await loadCreditNoteExports(models, events);
+    const rows = collectCreditNotesExportRows(events, exportLookup, filters, dateRange);
+
+    const rowsByBranch = new Map();
+    for (const row of rows) {
+      const branchId = String(row.branchId || 'Unassigned');
+      if (!rowsByBranch.has(branchId)) {
+        rowsByBranch.set(branchId, []);
+      }
+      rowsByBranch.get(branchId).push(row);
+    }
+    for (const branchRows of rowsByBranch.values()) {
+      branchRows.sort((left, right) => new Date(right.creditNoteDate) - new Date(left.creditNoteDate));
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Recon Dashboard';
+    workbook.created = new Date();
+
+    addCreditNotesSummarySheet(workbook, rowsByBranch, dateRange, filters);
+
+    const sortedBranches = Array.from(rowsByBranch.entries()).sort((left, right) => left[0].localeCompare(right[0]));
+    const usedSheetNames = new Set(['Summary by Branch']);
+    for (const [branchId, branchRows] of sortedBranches) {
+      let sheetName = sanitizeSheetName(`Branch ${branchId}`, 'Branch');
+      let suffix = 2;
+      while (usedSheetNames.has(sheetName)) {
+        sheetName = sanitizeSheetName(`Branch ${branchId} (${suffix})`, 'Branch');
+        suffix += 1;
+      }
+      usedSheetNames.add(sheetName);
+      addCreditNotesDetailSheet(workbook, sheetName, branchRows);
+    }
+
+    if (rows.length === 0) {
+      addCreditNotesDetailSheet(workbook, 'No Credit Notes', []);
+    }
+
+    const branchLabel = filters.branchId ? `branch-${filters.branchId}` : 'all-branches';
+    const fileName = `credit-note-report_${branchLabel}_${dateRange.startDate.slice(0, 10)}_to_${dateRange.endDate.slice(0, 10)}.xlsx`;
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (error) {
+    console.error('[reconciliation] /credit-notes/export failed', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate credit note report' });
+  }
+});
+
 router.get('/sales', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
   const page = parsePage(req.query.page);
@@ -1377,6 +1800,68 @@ router.get('/sales', reconAuth, async (req, res) => {
     totalRows: rows.length,
     page,
     pageSize,
+  });
+
+  const paginated = paginateRows(orderedRows, page, pageSize);
+
+  return res.json({
+    success: true,
+    filters: {
+      days: dateRange.days,
+      startDate: dateRange.startDate,
+      endDate: dateRange.endDate,
+      branchId: filters.branchId || null,
+      terminalId: filters.terminalId || null,
+      branchOptions,
+      terminalOptions,
+    },
+    pagination: paginated.pagination,
+    rows: paginated.rows,
+  });
+});
+
+router.get('/credit-notes', reconAuth, async (req, res) => {
+  const models = req.app.locals.models;
+  const page = parsePage(req.query.page);
+  const pageSize = parseLimit(req.query.pageSize || req.query.limit || 20);
+  const dateRange = buildDateRange(req.query);
+  const filters = {
+    branchId: req.query.branchId || '',
+    terminalId: req.query.terminalId || '',
+  };
+  console.log('[reconciliation] /credit-notes request', { query: req.query, dateRange, page, pageSize, filters });
+
+  const events = await loadEventsWithExports(models, CREDIT_NOTE_BATCH_EVENT_TYPE, dateRange);
+  const branchOptions = collectOptions(events.map((event) => getBranchId(event)));
+  const terminalOptions = collectOptions(events.map((event) => getTerminalId(event)));
+  const exportLookup = await loadCreditNoteExports(models, events);
+  const rows = [];
+
+  for (const syncEvent of events) {
+    if (!eventMatchesFilters(syncEvent, filters)) {
+      continue;
+    }
+
+    const exportsBySaleId = groupExportsBySaleId(syncEvent.saleExports || []);
+
+    for (const creditNote of getCreditNotes(syncEvent)) {
+      const globalExport = exportLookup.get(saleIdentityKey(syncEvent.store_id, creditNote.receipt_number, creditNote.id));
+      const eventScopedExports = exportsBySaleId.get(String(creditNote.id)) || [];
+      const creditNoteExportRows = globalExport ? [globalExport] : eventScopedExports;
+      const row = buildCreditNoteRow(syncEvent, creditNote, creditNoteExportRows);
+      if (!isDateInRange(row.creditNoteDate, dateRange)) {
+        continue;
+      }
+      rows.push(row);
+    }
+  }
+
+  const orderedRows = rows.sort((left, right) => {
+    if (right.syncEventId !== left.syncEventId) {
+      return right.syncEventId - left.syncEventId;
+    }
+
+    return Number(right.creditNoteId) - Number(left.creditNoteId);
   });
 
   const paginated = paginateRows(orderedRows, page, pageSize);

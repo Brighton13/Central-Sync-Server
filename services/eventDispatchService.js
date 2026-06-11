@@ -4,6 +4,7 @@ const SyncSaleExportService = require('./syncSaleExportService');
 
 const DOCUMENT_TYPES = {
   ORDER: 'oe_order',
+  CREDIT_NOTE: 'oe_credit_note',
 };
 
 class EventDispatchService {
@@ -94,6 +95,32 @@ class EventDispatchService {
     };
   }
 
+  // Mirrors resolvePendingSales but for the daily credit-note batch. Dedupe is keyed on the
+  // (globally unique) credit-note receipt number via syncSaleExport rows, so a re-posted or
+  // re-queued batch never creates a duplicate Sage credit-note document.
+  async resolvePendingCreditNotes(syncEvent, documentType) {
+    const payload = syncEvent.payload || {};
+    const creditNotes = payload.credit_notes || [];
+    const existingExports = await this.syncSaleExportService.findExportsForSales(syncEvent.store_id, creditNotes, documentType);
+    const exportedKeys = new Set(
+      existingExports.map((record) => this.syncSaleExportService.buildIdentityKey(
+        syncEvent.store_id,
+        record.receipt_number,
+        record.sale_id
+      ))
+    );
+    const pendingCreditNotes = creditNotes.filter((creditNote) => !exportedKeys.has(
+      this.syncSaleExportService.buildIdentityKey(syncEvent.store_id, creditNote.receipt_number, creditNote.id)
+    ));
+
+    return {
+      payload,
+      creditNotes,
+      existingExports,
+      pendingCreditNotes,
+    };
+  }
+
   async dispatch(syncEvent) {
     if (syncEvent.event_type === 'credit_note.created') {
       const payload = syncEvent.payload || {};
@@ -119,6 +146,52 @@ class EventDispatchService {
       return {
         ...result,
         creditNoteReference: creditNote.reference || creditNote.receipt_number || null,
+      };
+    }
+
+    if (syncEvent.event_type === 'credit_note_batch.ready') {
+      const { existingExports, pendingCreditNotes } = await this.resolvePendingCreditNotes(syncEvent, DOCUMENT_TYPES.CREDIT_NOTE);
+
+      if (pendingCreditNotes.length === 0) {
+        return {
+          success: true,
+          message: existingExports.length > 0
+            ? 'All credit notes in batch were already exported to Sage'
+            : 'No credit notes present in batch payload',
+          deduplicated: existingExports.length > 0,
+          staged: existingExports.length === 0,
+          skippedCreditNotesCount: existingExports.length,
+          orderNumber: existingExports[0]?.sage_document_number || null,
+          orderUniquifier: existingExports[0]?.sage_document_uniquifier || null,
+        };
+      }
+
+      const payload = syncEvent.payload || {};
+      const user = pendingCreditNotes[0]?.cashier || null;
+      const branchId = this.resolveBranchId(payload, user);
+      const terminalId = this.resolveTerminalId(payload, user);
+      const result = await this.sageCreditNoteService.createConsolidatedCreditNoteReturn(
+        pendingCreditNotes,
+        user,
+        payload.date,
+        {
+          orderReference: syncEvent.idempotency_key,
+          branchId,
+          terminalId,
+        }
+      );
+
+      const persistedExports = await this.syncSaleExportService.persistExports(
+        syncEvent,
+        pendingCreditNotes,
+        result,
+        DOCUMENT_TYPES.CREDIT_NOTE
+      );
+
+      return {
+        ...result,
+        skippedCreditNotesCount: existingExports.length,
+        persistedCreditNotesCount: persistedExports.length,
       };
     }
 
