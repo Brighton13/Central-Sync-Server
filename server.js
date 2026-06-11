@@ -120,10 +120,39 @@ async function ensureSyncSaleExportsSchema() {
   }
 }
 
+// Ensure indexes exist on frequently-sorted columns. Tables like `sync_events` and
+// `recon_audit_logs` carry large JSON/TEXT columns (payload, response_payload,
+// last_error, details). Without an index on the ORDER BY column, MySQL filesorts the
+// matching rows and buffers those blobs, overflowing sort_buffer_size at scale
+// (ER_OUT_OF_SORTMEMORY). Idempotent: only adds an index when missing.
+async function ensureReconIndexes() {
+  const queryInterface = models.sequelize.getQueryInterface();
+
+  const indexPlan = [
+    ['sync_events', ['event_type', 'received_at'], 'idx_sync_events_type_received'],
+    ['sync_events', ['status'], 'idx_sync_events_status'],
+    ['recon_audit_logs', ['occurred_at'], 'idx_recon_audit_logs_occurred_at'],
+  ];
+
+  for (const [table, fields, name] of indexPlan) {
+    try {
+      const existing = await queryInterface.showIndex(table);
+      if (existing.some((index) => index.name === name)) {
+        continue;
+      }
+      await queryInterface.addIndex(table, fields, { name });
+      console.log(`Created index ${name} on ${table}(${fields.join(', ')})`);
+    } catch (error) {
+      console.warn(`Skipped index ${name} on ${table}: ${error.message}`);
+    }
+  }
+}
+
 async function start() {
   await models.sequelize.authenticate();
   await ensureSyncSaleExportsSchema();
   await models.sequelize.sync();
+  await ensureReconIndexes();
   await ensureDefaultReconUsers(models);
 
   sageWorker = createSageWorker(models);

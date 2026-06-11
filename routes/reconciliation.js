@@ -1,5 +1,6 @@
 const express = require('express');
 const { Op } = require('sequelize');
+const ExcelJS = require('exceljs');
 
 const { reconAuth, requireReconRole } = require('../middleware/reconAuth');
 const { queueSyncEvent } = require('../services/syncEventQueueService');
@@ -994,6 +995,334 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
   });
 });
 
+// Excel sheet names are limited to 31 chars and cannot contain : \ / ? * [ ]
+function sanitizeSheetName(name, fallback = 'Sheet') {
+  const cleaned = String(name == null ? '' : name).replace(/[\\/?*\[\]:]/g, ' ').trim();
+  return (cleaned || fallback).slice(0, 31);
+}
+
+function getSaleCustomerName(sale) {
+  const customer = sale.customer || null;
+  if (!customer) {
+    return null;
+  }
+  return customer.legal_name || customer.name || null;
+}
+
+function getSaleCashierName(sale) {
+  return sale.cashier?.full_name || sale.cashier?.fullName || null;
+}
+
+// Builds one finance-facing sale row. Reuses buildSaleRow so branch/terminal/date/
+// Sage-posting values match the dashboard exactly, and adds the financial breakdown
+// (subtotal/discount/tax/total) finance needs.
+function buildSalesExportRow(syncEvent, sale, saleExportRows) {
+  const base = buildSaleRow(syncEvent, sale, saleExportRows);
+  return {
+    saleDate: base.saleDate,
+    branchId: base.branchId,
+    terminalId: base.terminalId,
+    storeId: base.storeId,
+    receiptNumber: base.receiptNumber,
+    invoiceNo: sale.invoice_no || sale.invnumber || null,
+    customer: getSaleCustomerName(sale),
+    cashier: getSaleCashierName(sale),
+    paymentMethod: base.paymentMethod,
+    subtotal: roundCurrency(sale.subtotal),
+    discount: roundCurrency(sale.discount_amount),
+    tax: roundCurrency(sale.tax_amount),
+    total: roundCurrency(sale.total_amount),
+    postedToSage: base.postedToSage,
+    sageOrderNumber: base.oeOrderNumber,
+    sageReference: base.sageReference,
+  };
+}
+
+// Collects deduped sale rows for the finance export. Sales are deduped by their
+// globally-unique identity (receipt number) so a sale that appears in more than one
+// day-end batch (e.g. a re-queued batch) is never double-counted in finance totals.
+// The latest batch (highest sync event id) wins.
+function collectSalesExportRows(events, exportLookup, filters, dateRange) {
+  const rowsByKey = new Map();
+  const orderedEvents = [...events].sort((left, right) => left.id - right.id);
+
+  for (const syncEvent of orderedEvents) {
+    if (!eventMatchesFilters(syncEvent, filters)) {
+      continue;
+    }
+
+    const saleExportsBySaleId = groupExportsBySaleId(syncEvent.saleExports || []);
+
+    for (const sale of getSales(syncEvent)) {
+      const key = saleIdentityKey(syncEvent.store_id, sale.receipt_number, sale.id);
+      const globalExport = exportLookup.get(key);
+      const eventScopedExports = saleExportsBySaleId.get(String(sale.id)) || [];
+      const saleExportRows = globalExport ? [globalExport] : eventScopedExports;
+      const row = buildSalesExportRow(syncEvent, sale, saleExportRows);
+
+      if (!isDateInRange(row.saleDate, dateRange)) {
+        continue;
+      }
+
+      rowsByKey.set(key, row);
+    }
+  }
+
+  return Array.from(rowsByKey.values());
+}
+
+const CURRENCY_FORMAT = '#,##0.00';
+const SALES_EXPORT_COLUMNS = [
+  { header: 'Sale Date', key: 'saleDate', width: 20 },
+  { header: 'Branch', key: 'branchId', width: 12 },
+  { header: 'Terminal', key: 'terminalId', width: 12 },
+  { header: 'Receipt #', key: 'receiptNumber', width: 20 },
+  { header: 'Invoice #', key: 'invoiceNo', width: 20 },
+  { header: 'Customer', key: 'customer', width: 24 },
+  { header: 'Cashier', key: 'cashier', width: 20 },
+  { header: 'Payment Method', key: 'paymentMethod', width: 16 },
+  { header: 'Subtotal', key: 'subtotal', width: 14, money: true },
+  { header: 'Discount', key: 'discount', width: 14, money: true },
+  { header: 'Tax', key: 'tax', width: 14, money: true },
+  { header: 'Total', key: 'total', width: 14, money: true },
+  { header: 'Posted to Sage', key: 'postedToSageLabel', width: 14 },
+  { header: 'Sage Order #', key: 'sageOrderNumber', width: 18 },
+  { header: 'Sage Reference', key: 'sageReference', width: 22 },
+];
+
+function formatExcelDate(value) {
+  if (!value) {
+    return null;
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date;
+}
+
+function styleHeaderRow(row) {
+  row.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  row.alignment = { vertical: 'middle' };
+  row.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F2937' } };
+    cell.border = { bottom: { style: 'thin', color: { argb: 'FF374151' } } };
+  });
+}
+
+function addSalesDetailSheet(workbook, sheetName, rows) {
+  const sheet = workbook.addWorksheet(sheetName);
+  sheet.columns = SALES_EXPORT_COLUMNS.map((column) => ({
+    header: column.header,
+    key: column.key,
+    width: column.width,
+  }));
+  styleHeaderRow(sheet.getRow(1));
+
+  for (const row of rows) {
+    sheet.addRow({
+      ...row,
+      saleDate: formatExcelDate(row.saleDate),
+      postedToSageLabel: row.postedToSage ? 'Yes' : 'No',
+    });
+  }
+
+  // Number formats
+  SALES_EXPORT_COLUMNS.forEach((column, index) => {
+    if (column.money) {
+      sheet.getColumn(index + 1).numFmt = CURRENCY_FORMAT;
+    }
+  });
+  const dateColumn = sheet.getColumn(1);
+  dateColumn.numFmt = 'yyyy-mm-dd hh:mm';
+
+  // Totals row
+  const totals = rows.reduce(
+    (acc, row) => ({
+      subtotal: acc.subtotal + parseNumber(row.subtotal),
+      discount: acc.discount + parseNumber(row.discount),
+      tax: acc.tax + parseNumber(row.tax),
+      total: acc.total + parseNumber(row.total),
+    }),
+    { subtotal: 0, discount: 0, tax: 0, total: 0 }
+  );
+
+  const totalRow = sheet.addRow({
+    customer: `TOTAL (${rows.length} sales)`,
+    subtotal: roundCurrency(totals.subtotal),
+    discount: roundCurrency(totals.discount),
+    tax: roundCurrency(totals.tax),
+    total: roundCurrency(totals.total),
+  });
+  totalRow.font = { bold: true };
+  totalRow.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE5E7EB' } };
+  });
+
+  sheet.views = [{ state: 'frozen', ySplit: 1 }];
+  sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: SALES_EXPORT_COLUMNS.length } };
+  return sheet;
+}
+
+function addSalesSummarySheet(workbook, rowsByBranch, dateRange, filters) {
+  const sheet = workbook.addWorksheet('Summary by Branch');
+  sheet.mergeCells('A1:H1');
+  sheet.getCell('A1').value = 'Sales Report by Branch';
+  sheet.getCell('A1').font = { bold: true, size: 16 };
+
+  sheet.mergeCells('A2:H2');
+  sheet.getCell('A2').value =
+    `Period: ${dateRange.startDate.slice(0, 10)} to ${dateRange.endDate.slice(0, 10)}`
+    + (filters.branchId ? `  |  Branch: ${filters.branchId}` : '')
+    + (filters.terminalId ? `  |  Terminal: ${filters.terminalId}` : '');
+  sheet.getCell('A2').font = { italic: true, color: { argb: 'FF6B7280' } };
+
+  sheet.mergeCells('A3:H3');
+  sheet.getCell('A3').value = `Generated: ${new Date().toISOString()}`;
+  sheet.getCell('A3').font = { italic: true, color: { argb: 'FF6B7280' } };
+
+  const headerRowIndex = 5;
+  const headers = ['Branch', 'Sales Count', 'Subtotal', 'Discount', 'Tax', 'Total', 'Posted to Sage', 'Pending'];
+  const headerRow = sheet.getRow(headerRowIndex);
+  headers.forEach((header, index) => {
+    headerRow.getCell(index + 1).value = header;
+  });
+  styleHeaderRow(headerRow);
+
+  sheet.columns = [
+    { width: 14 },
+    { width: 14 },
+    { width: 16 },
+    { width: 16 },
+    { width: 16 },
+    { width: 16 },
+    { width: 16 },
+    { width: 12 },
+  ];
+
+  const grand = { count: 0, subtotal: 0, discount: 0, tax: 0, total: 0, posted: 0, pending: 0 };
+  const sortedBranches = Array.from(rowsByBranch.entries()).sort((left, right) => left[0].localeCompare(right[0]));
+
+  let cursor = headerRowIndex + 1;
+  for (const [branchId, rows] of sortedBranches) {
+    const agg = rows.reduce(
+      (acc, row) => ({
+        subtotal: acc.subtotal + parseNumber(row.subtotal),
+        discount: acc.discount + parseNumber(row.discount),
+        tax: acc.tax + parseNumber(row.tax),
+        total: acc.total + parseNumber(row.total),
+        posted: acc.posted + (row.postedToSage ? 1 : 0),
+      }),
+      { subtotal: 0, discount: 0, tax: 0, total: 0, posted: 0 }
+    );
+    const pending = rows.length - agg.posted;
+
+    const row = sheet.getRow(cursor);
+    row.getCell(1).value = branchId;
+    row.getCell(2).value = rows.length;
+    row.getCell(3).value = roundCurrency(agg.subtotal);
+    row.getCell(4).value = roundCurrency(agg.discount);
+    row.getCell(5).value = roundCurrency(agg.tax);
+    row.getCell(6).value = roundCurrency(agg.total);
+    row.getCell(7).value = agg.posted;
+    row.getCell(8).value = pending;
+    cursor += 1;
+
+    grand.count += rows.length;
+    grand.subtotal += agg.subtotal;
+    grand.discount += agg.discount;
+    grand.tax += agg.tax;
+    grand.total += agg.total;
+    grand.posted += agg.posted;
+    grand.pending += pending;
+  }
+
+  const totalRow = sheet.getRow(cursor);
+  totalRow.getCell(1).value = 'ALL BRANCHES';
+  totalRow.getCell(2).value = grand.count;
+  totalRow.getCell(3).value = roundCurrency(grand.subtotal);
+  totalRow.getCell(4).value = roundCurrency(grand.discount);
+  totalRow.getCell(5).value = roundCurrency(grand.tax);
+  totalRow.getCell(6).value = roundCurrency(grand.total);
+  totalRow.getCell(7).value = grand.posted;
+  totalRow.getCell(8).value = grand.pending;
+  totalRow.font = { bold: true };
+  totalRow.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE5E7EB' } };
+  });
+
+  [3, 4, 5, 6].forEach((columnIndex) => {
+    sheet.getColumn(columnIndex).numFmt = CURRENCY_FORMAT;
+  });
+
+  return sheet;
+}
+
+router.get('/sales/export', reconAuth, async (req, res) => {
+  const models = req.app.locals.models;
+  const dateRange = buildDateRange(req.query);
+  const filters = {
+    branchId: req.query.branchId || '',
+    terminalId: req.query.terminalId || '',
+  };
+  console.log('[reconciliation] /sales/export request', { query: req.query, dateRange, filters });
+
+  try {
+    const events = await loadEventsWithExports(models, SALES_EVENT_TYPE, dateRange);
+    const exportLookup = await loadExportsForSales(models, events);
+    const rows = collectSalesExportRows(events, exportLookup, filters, dateRange);
+
+    // Group rows by branch for the per-branch sheets, sorted newest sale first.
+    const rowsByBranch = new Map();
+    for (const row of rows) {
+      const branchId = String(row.branchId || 'Unassigned');
+      if (!rowsByBranch.has(branchId)) {
+        rowsByBranch.set(branchId, []);
+      }
+      rowsByBranch.get(branchId).push(row);
+    }
+    for (const branchRows of rowsByBranch.values()) {
+      branchRows.sort((left, right) => new Date(right.saleDate) - new Date(left.saleDate));
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Recon Dashboard';
+    workbook.created = new Date();
+
+    addSalesSummarySheet(workbook, rowsByBranch, dateRange, filters);
+
+    const sortedBranches = Array.from(rowsByBranch.entries()).sort((left, right) => left[0].localeCompare(right[0]));
+    const usedSheetNames = new Set(['Summary by Branch']);
+    for (const [branchId, branchRows] of sortedBranches) {
+      let sheetName = sanitizeSheetName(`Branch ${branchId}`, 'Branch');
+      let suffix = 2;
+      while (usedSheetNames.has(sheetName)) {
+        sheetName = sanitizeSheetName(`Branch ${branchId} (${suffix})`, 'Branch');
+        suffix += 1;
+      }
+      usedSheetNames.add(sheetName);
+      addSalesDetailSheet(workbook, sheetName, branchRows);
+    }
+
+    if (rows.length === 0) {
+      // Still return a valid (empty) workbook so finance gets a clear "no data" file.
+      addSalesDetailSheet(workbook, 'No Sales', []);
+    }
+
+    const branchLabel = filters.branchId ? `branch-${filters.branchId}` : 'all-branches';
+    const fileName = `sales-report_${branchLabel}_${dateRange.startDate.slice(0, 10)}_to_${dateRange.endDate.slice(0, 10)}.xlsx`;
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (error) {
+    console.error('[reconciliation] /sales/export failed', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to generate sales report' });
+  }
+});
+
 router.get('/sales', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
   const page = parsePage(req.query.page);
@@ -1189,13 +1518,16 @@ router.post('/batches/repost-pending', reconAuth, requireReconRole('admin'), asy
   const dryRun = body.dryRun !== false;
   const limit = Math.min(Math.max(Math.trunc(Number(body.limit) || 25), 1), 200);
 
+  // Sort in JS instead of SQL: ORDER BY over this result set would filesort the large
+  // JSON payload/response_payload/last_error columns and can overflow sort_buffer_size
+  // (ER_OUT_OF_SORTMEMORY). All matching rows are processed anyway, so JS sort is exact.
   const events = await models.syncEvent.findAll({
     where: {
       event_type: SALES_EVENT_TYPE,
       received_at: buildRangeWhere(dateRange),
     },
-    order: [['id', 'ASC']],
   });
+  events.sort((left, right) => left.id - right.id);
 
   const dispatchService = new EventDispatchService(models);
   const candidates = [];
