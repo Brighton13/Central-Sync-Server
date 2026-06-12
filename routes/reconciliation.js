@@ -11,7 +11,7 @@ const router = express.Router();
 const RELEVANT_EVENT_TYPES = ['day_end.ready', 'credit_note.created', 'credit_note_batch.ready'];
 const SALES_EVENT_TYPE = 'day_end.ready';
 const CREDIT_NOTE_BATCH_EVENT_TYPE = 'credit_note_batch.ready';
-const ZRA_COMPLIANCE_EVENT_TYPES = ['sale.created', 'sale.updated'];
+// ZRA compliance is measured from day-end batch sales (same pool as the dashboard summary).
 const EVENT_TYPE_LABELS = {
   'day_end.ready': 'OE Order Batch',
   'sale.created': 'Sale Created',
@@ -181,38 +181,47 @@ function serializeSyncEvent(syncEvent) {
   };
 }
 
-function getComplianceSale(syncEvent) {
-  const payload = getPayload(syncEvent);
-  if (payload.sale && typeof payload.sale === 'object') {
-    return payload.sale;
+function hasSaleSdcData(sale) {
+  return Boolean(sale?.sdcid && sale?.receipt_no);
+}
+
+function getSaleZraStatus(sale) {
+  return String(sale?.zra_status || sale?.zraStatus || 'pending').toLowerCase();
+}
+
+function isSaleReceiptPrinted(sale) {
+  return Boolean(sale?.receipt_printed ?? sale?.receiptPrinted ?? false);
+}
+
+function hasSaleQrArtifact(sale) {
+  return Boolean(sale?.qrfilepath || sale?.qrFilePath || sale?.qrcode_url || sale?.qrcodeUrl);
+}
+
+// Collects deduped sales from day-end batches (latest batch wins), matching /summary.
+function collectDayEndSalesForCompliance(events) {
+  const rowsByKey = new Map();
+  const orderedEvents = [...events].sort((left, right) => left.id - right.id);
+
+  for (const syncEvent of orderedEvents) {
+    if (syncEvent.event_type !== SALES_EVENT_TYPE) {
+      continue;
+    }
+
+    const branchId = String(getBranchId(syncEvent) || 'Unassigned');
+    const terminalId = String(getTerminalId(syncEvent) || 'Unassigned');
+
+    for (const sale of getSales(syncEvent)) {
+      const key = saleIdentityKey(syncEvent.store_id, sale.receipt_number, sale.id);
+      rowsByKey.set(key, {
+        sale,
+        branchId,
+        terminalId,
+        saleDate: sale.sale_date || sale.createdAt || getPayload(syncEvent).date || syncEvent.received_at,
+      });
+    }
   }
 
-  return payload;
-}
-
-function getComplianceBranchId(syncEvent) {
-  const payload = getPayload(syncEvent);
-  return payload.branch_id || payload.sale?.branch_id || null;
-}
-
-function getComplianceTerminalId(syncEvent) {
-  const payload = getPayload(syncEvent);
-  return payload.terminal_id || payload.sale?.terminal_id || payload.branch_id || null;
-}
-
-function getZraStatus(syncEvent) {
-  const sale = getComplianceSale(syncEvent);
-  return String(sale.zra_status || sale.zraStatus || 'pending').toLowerCase();
-}
-
-function isReceiptPrinted(syncEvent) {
-  const sale = getComplianceSale(syncEvent);
-  return Boolean(sale.receipt_printed ?? sale.receiptPrinted ?? false);
-}
-
-function hasQrArtifact(syncEvent) {
-  const sale = getComplianceSale(syncEvent);
-  return Boolean(sale.qrfilepath || sale.qrFilePath || sale.qrcode_url || sale.qrcodeUrl);
+  return Array.from(rowsByKey.values());
 }
 
 function getSales(syncEvent) {
@@ -277,10 +286,6 @@ function getCreditNoteTotal(syncEvent) {
   );
 }
 
-function makeSaleKey(storeId, saleId) {
-  return `${storeId}:${String(saleId)}`;
-}
-
 // Globally-unique sale identity across all client POS backends.
 // store_id and sale.id are LOCAL to each client (many clients reuse store_id=1 and
 // overlapping sale ids), so they cannot identify a sale on their own. The receipt
@@ -292,35 +297,6 @@ function saleIdentityKey(storeId, receiptNumber, saleId) {
   }
 
   return `sid:${storeId}:${String(saleId)}`;
-}
-
-function getComplianceSaleKey(syncEvent) {
-  const sale = getComplianceSale(syncEvent);
-  const saleId = sale.id || syncEvent.aggregate_id;
-
-  if (!saleId) {
-    return null;
-  }
-
-  return makeSaleKey(syncEvent.store_id, saleId);
-}
-
-function selectLatestComplianceEvents(events) {
-  const latestBySale = new Map();
-
-  for (const syncEvent of events) {
-    const saleKey = getComplianceSaleKey(syncEvent);
-    if (!saleKey) {
-      continue;
-    }
-
-    const existingEvent = latestBySale.get(saleKey);
-    if (!existingEvent || syncEvent.id > existingEvent.id) {
-      latestBySale.set(saleKey, syncEvent);
-    }
-  }
-
-  return Array.from(latestBySale.values());
 }
 
 function toStatusBucket(status) {
@@ -367,6 +343,7 @@ function upsertComplianceBucket(collection, key, label) {
       submittedCount: 0,
       pendingCount: 0,
       failedCount: 0,
+      missingSdcCount: 0,
       receiptPrintedCount: 0,
       qrArtifactCount: 0,
       lastSaleAt: null,
@@ -1020,9 +997,9 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
     dateRange,
     limit,
   });
-  const events = selectLatestComplianceEvents(
-    await loadEventsWithExports(models, ZRA_COMPLIANCE_EVENT_TYPES, dateRange)
-  );
+
+  const events = await loadEventsWithExports(models, SALES_EVENT_TYPE, dateRange);
+  const complianceSales = collectDayEndSalesForCompliance(events);
 
   const terminalCompliance = new Map();
   const branchCompliance = new Map();
@@ -1030,19 +1007,12 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
   let submittedCount = 0;
   let pendingCount = 0;
   let failedCount = 0;
+  let missingSdcCount = 0;
   let receiptPrintedCount = 0;
   let qrArtifactCount = 0;
 
-  for (const syncEvent of events) {
-    const branchId = String(getComplianceBranchId(syncEvent) || 'Unassigned');
-    const terminalId = String(getComplianceTerminalId(syncEvent) || 'Unassigned');
-    const sale = getComplianceSale(syncEvent);
-    const zraStatus = getZraStatus(syncEvent);
-    const printed = isReceiptPrinted(syncEvent);
-    const hasQr = hasQrArtifact(syncEvent);
-    const saleDate = sale.sale_date || syncEvent.received_at;
+  for (const { sale, branchId, terminalId, saleDate } of complianceSales) {
     const key = `${branchId}:${terminalId}`;
-
     const terminalBucket = upsertComplianceBucket(terminalCompliance, key, `Terminal ${terminalId}`);
     const branchBucket = upsertComplianceBucket(branchCompliance, branchId, `Branch ${branchId}`);
 
@@ -1054,18 +1024,29 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
     terminalBucket.totalSalesCount += 1;
     branchBucket.totalSalesCount += 1;
 
-    if (zraStatus === 'sent') {
+    const hasSdc = hasSaleSdcData(sale);
+    const zraStatus = getSaleZraStatus(sale);
+    const printed = isSaleReceiptPrinted(sale);
+    const hasQr = hasSaleQrArtifact(sale);
+
+    if (hasSdc) {
       submittedCount += 1;
       terminalBucket.submittedCount += 1;
       branchBucket.submittedCount += 1;
-    } else if (zraStatus === 'failed') {
-      failedCount += 1;
-      terminalBucket.failedCount += 1;
-      branchBucket.failedCount += 1;
     } else {
-      pendingCount += 1;
-      terminalBucket.pendingCount += 1;
-      branchBucket.pendingCount += 1;
+      missingSdcCount += 1;
+      terminalBucket.missingSdcCount = (terminalBucket.missingSdcCount || 0) + 1;
+      branchBucket.missingSdcCount = (branchBucket.missingSdcCount || 0) + 1;
+
+      if (zraStatus === 'failed') {
+        failedCount += 1;
+        terminalBucket.failedCount += 1;
+        branchBucket.failedCount += 1;
+      } else {
+        pendingCount += 1;
+        terminalBucket.pendingCount += 1;
+        branchBucket.pendingCount += 1;
+      }
     }
 
     if (printed) {
@@ -1088,6 +1069,15 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
       branchBucket.lastSaleAt = saleDate || null;
     }
   }
+
+  console.log('[reconciliation] /zra-compliance result', {
+    totalSalesCount,
+    submittedCount,
+    missingSdcCount,
+    pendingCount,
+    failedCount,
+    source: SALES_EVENT_TYPE,
+  });
 
   const terminalRows = Array.from(terminalCompliance.values())
     .map((row) => ({
@@ -1134,11 +1124,13 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
       submittedCount,
       pendingCount,
       failedCount,
+      missingSdcCount,
       receiptPrintedCount,
       qrArtifactCount,
       complianceRate: calculateComplianceRate(submittedCount, totalSalesCount),
       printedRate: calculateComplianceRate(receiptPrintedCount, totalSalesCount),
       qrRate: calculateComplianceRate(qrArtifactCount, totalSalesCount),
+      source: 'day_end.ready',
     },
     branchCompliance: branchRows,
     terminalCompliance: terminalRows,
