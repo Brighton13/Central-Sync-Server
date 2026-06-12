@@ -1422,11 +1422,11 @@ router.get('/sales/export', reconAuth, async (req, res) => {
     // Group rows by branch for the per-branch sheets, sorted newest sale first.
     const rowsByBranch = new Map();
     for (const row of rows) {
-      const branchId = String(row.branchId || 'Unassigned');
-      if (!rowsByBranch.has(branchId)) {
-        rowsByBranch.set(branchId, []);
+      const terminalId = String(row.terminalId || 'Unassigned');
+      if (!rowsByBranch.has(terminalId)) {
+        rowsByBranch.set(terminalId, []);
       }
-      rowsByBranch.get(branchId).push(row);
+      rowsByBranch.get(terminalId).push(row);
     }
     for (const branchRows of rowsByBranch.values()) {
       branchRows.sort((left, right) => new Date(right.saleDate) - new Date(left.saleDate));
@@ -1440,11 +1440,11 @@ router.get('/sales/export', reconAuth, async (req, res) => {
 
     const sortedBranches = Array.from(rowsByBranch.entries()).sort((left, right) => left[0].localeCompare(right[0]));
     const usedSheetNames = new Set(['Summary by Branch']);
-    for (const [branchId, branchRows] of sortedBranches) {
-      let sheetName = sanitizeSheetName(`Branch ${branchId}`, 'Branch');
+    for (const [TerminalId, branchRows] of sortedBranches) {
+      let sheetName = sanitizeSheetName(`${TerminalId}`, 'Branch');
       let suffix = 2;
       while (usedSheetNames.has(sheetName)) {
-        sheetName = sanitizeSheetName(`Branch ${branchId} (${suffix})`, 'Branch');
+        sheetName = sanitizeSheetName(`${TerminalId} (${suffix})`, 'Branch');
         suffix += 1;
       }
       usedSheetNames.add(sheetName);
