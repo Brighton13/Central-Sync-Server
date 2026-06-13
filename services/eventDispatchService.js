@@ -140,6 +140,7 @@ class EventDispatchService {
           orderReference: payload.credit_note?.reference || creditNote.reference || undefined,
           branchId,
           terminalId,
+          syncModels: this.models,
         }
       );
 
@@ -178,6 +179,8 @@ class EventDispatchService {
           orderReference: syncEvent.idempotency_key,
           branchId,
           terminalId,
+          reconcileExisting: (syncEvent.retry_count || 0) > 0,
+          syncModels: this.models,
         }
       );
 

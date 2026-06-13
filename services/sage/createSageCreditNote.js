@@ -1,5 +1,7 @@
 const axios = require('axios');
 
+const CREDIT_DEBIT_RESOURCE = 'OE/OECreditDebitNotes';
+
 class SageCreditNoteService {
   constructor() {
     this.timeout = Number(process.env.SAGE_TIMEOUT_MS || 60000);
@@ -49,210 +51,247 @@ class SageCreditNoteService {
     };
   }
 
-  buildOrderReference(creditNote, originalSale, date) {
-    const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || 'CREDIT-NOTE';
-    const originalSaleRef = originalSale?.receipt_number || originalSale?.invoice_no || originalSale?.receipt_no || originalSale?.id || 'SALE';
-    const datePart = date ? new Date(date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-    const sdcSuffix = creditNote?.sdcid ? ` / SDC:${creditNote.sdcid}` : '';
-    return `CN ${creditNoteRef} / ${originalSaleRef} - ${datePart}${sdcSuffix}`;
+  escapeODataString(value) {
+    return String(value).replace(/'/g, "''");
   }
 
-  buildOrderDetails(items, user, creditNoteRef) {
-    let detailNumber = 1;
+  resolveNoteDate(creditNote, fallbackDate) {
+    return creditNote?.sage_invoice_date
+      || creditNote?.credit_note_date
+      || fallbackDate
+      || new Date().toISOString();
+  }
+
+  resolveOriginalSaleReceipt(creditNote) {
+    if (creditNote?.original_sale_receipt_number) {
+      return creditNote.original_sale_receipt_number;
+    }
+
+    const receiptNumber = String(creditNote?.receipt_number || '');
+    if (receiptNumber.startsWith('CN-')) {
+      return receiptNumber.slice(3);
+    }
+
+    return null;
+  }
+
+  buildFiscalPeriod(dateValue) {
+    const month = new Date(dateValue).getUTCMonth() + 1;
+    return `Num${month}`;
+  }
+
+  mapDispatchResult(entity, fallbackReference) {
+    return {
+      success: true,
+      status: 200,
+      data: entity,
+      responseBody: entity,
+      sageResponse: entity,
+      documentNumber: entity?.CreditDebitNoteNumber || null,
+      documentUniquifier: entity?.CNUniquifier == null
+        ? (entity?.CreditDebitNoteUniquifier == null ? null : String(entity.CreditDebitNoteUniquifier))
+        : String(entity.CNUniquifier),
+      documentReference: entity?.CreditDebitNoteNumber || fallbackReference || null,
+    };
+  }
+
+  async findExistingCreditDebitNote(creditDebitNoteNumber) {
+    if (!creditDebitNoteNumber) {
+      return null;
+    }
+
+    const { baseUrl, headers } = this.getAuthConfig();
+    const response = await axios.get(`${baseUrl}/${CREDIT_DEBIT_RESOURCE}`, {
+      headers,
+      params: {
+        $filter: `CreditDebitNoteNumber eq '${this.escapeODataString(creditDebitNoteNumber)}'`,
+        $top: 1,
+      },
+      timeout: this.timeout,
+    });
+
+    return response.data?.value?.[0] || null;
+  }
+
+  async findInvoiceForOrder(orderNumber) {
+    if (!orderNumber) {
+      return null;
+    }
+
+    const { baseUrl, headers } = this.getAuthConfig();
+    const response = await axios.get(`${baseUrl}/OE/OEInvoices`, {
+      headers,
+      params: {
+        $filter: `OrderNumber eq '${this.escapeODataString(orderNumber)}'`,
+        $orderby: 'InvoiceDate desc',
+        $top: 1,
+      },
+      timeout: this.timeout,
+    });
+
+    return response.data?.value?.[0] || null;
+  }
+
+  // Enriches the credit note with Sage order/invoice references when available.
+  // Invoice linkage is optional — credit notes can post without it.
+  async resolveCreditNoteReferences(creditNote, syncModels = null) {
+    const originalSaleReceipt = this.resolveOriginalSaleReceipt(creditNote);
+    if (!originalSaleReceipt || !syncModels?.syncSaleExport) {
+      return creditNote;
+    }
+
+    const orderExport = await syncModels.syncSaleExport.findOne({
+      where: {
+        receipt_number: originalSaleReceipt,
+        document_type: 'oe_order',
+      },
+      order: [['id', 'DESC']],
+    });
+
+    const sageOrderNumber = creditNote.sage_order_number || orderExport?.sage_document_number || null;
+    if (!sageOrderNumber) {
+      return {
+        ...creditNote,
+        original_sale_receipt_number: originalSaleReceipt,
+      };
+    }
+
+    const invoice = await this.findInvoiceForOrder(sageOrderNumber);
+    return {
+      ...creditNote,
+      original_sale_receipt_number: originalSaleReceipt,
+      sage_order_number: sageOrderNumber,
+      sage_invoice_number: creditNote.sage_invoice_number || invoice?.InvoiceNumber || null,
+      sage_invoice_date: creditNote.sage_invoice_date || invoice?.InvoiceDate || null,
+    };
+  }
+
+  buildCreditDebitDetails(items, user, creditNoteRef) {
+    let lineNumber = 1;
+    const locationCode = user?.store?.store_number || '';
+
     return items.map((rawItem) => {
       const item = this.normalizeItem(rawItem);
-
       const detail = {
-        LineNumber: detailNumber * 32,
+        LineNumber: lineNumber * 32,
         LineType: 'Item',
         Item: item.code,
         Description: `${creditNoteRef} - ${item.description}`,
-        Category: user?.store?.store_customer_number || '',
-        Location: user?.store?.store_number || '',
-        StockItem: true,
-        QuantityOrdered: item.quantity,
-        OrderUnitOfMeasure: 'EACH',
-        OrderUnitConversion: 1,
-        OrderUnitPrice: this.to4(item.unitPrice),
+        Location: locationCode,
+        QuantityReturned: item.quantity,
+        CreditDebitNoteUOM: 'EACH',
+        UnitConversion: 1,
+        UnitPrice: this.to4(item.unitPrice),
         PriceOverride: true,
-        PricingUnitOfMeasure: 'EACH',
-        PricingUnitPrice: this.to4(item.unitPrice),
-        PricingUnitConversion: 1,
-        DetailNumber: detailNumber,
+        ReturnType: 'ItemsReturnedToInventory',
         TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
         TaxClass1: 1,
         TaxIncluded1: true,
         UpdateOperation: 'Unspecified',
       };
 
-      detailNumber += 1;
+      lineNumber += 1;
       return detail;
     });
   }
 
-  extractOrderEntity(payload) {
-    if (!payload) {
-      return null;
+  buildCreditDebitNote(creditNote, items, user, originalSale = null, options = {}) {
+    const noteDate = this.resolveNoteDate(creditNote, options.date);
+    const parsedDate = new Date(noteDate);
+    const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || `CN-${creditNote?.id}`;
+    const creditDebitNoteNumber = options.creditDebitNoteNumber || creditNoteRef;
+    const customerName = creditNote?.customer?.name || user?.store?.store_location || 'POS Customer';
+    const locationCode = user?.store?.store_number || '';
+    const currency = user?.store?.currency || creditNote?.currency || 'ZMW';
+    const taxGroup = user?.store?.store_tax_group || 'VATZMW';
+
+    const orderNumber = options.orderNumber || creditNote?.sage_order_number || originalSale?.sage_order_number || '';
+    const invoiceNumber = options.invoiceNumber || creditNote?.sage_invoice_number || '';
+
+    const payload = {
+      CreditDebitNoteNumber: creditDebitNoteNumber,
+      CreditDebitNoteType: 'CreditNote',
+      CustomerNumber: user?.store?.store_customer_number || creditNote?.customer?.customer_number || '1101',
+      BillTo: customerName,
+      BillToAddress1: creditNote?.customer?.address || '',
+      BillToCity: creditNote?.customer?.city || '',
+      DefaultLocationCode: locationCode,
+      DefaultPriceListCode: user?.store?.price_list_code || '01',
+      Description: creditNote?.notes || `POS credit note ${creditNoteRef}`,
+      CreditDebitNoteDate: noteDate,
+      CreditDebitNoteFiscalYear: String(parsedDate.getUTCFullYear()),
+      CreditDebitNoteFiscalPeriod: this.buildFiscalPeriod(noteDate),
+      ReturnDate: noteDate,
+      CreditDebitNoteHomeCurrency: currency,
+      CreditDebitNoteRateType: 'SP',
+      CreditDebitNoteSourceCurr: currency,
+      CreditDebitNoteRateDate: noteDate,
+      CreditDebitNoteRate: 1,
+      TaxGroup: taxGroup,
+      TaxAuthority1: taxGroup,
+      TaxClass1: 1,
+      UpdateOperation: 'Unspecified',
+      CreditDebitDetails: this.buildCreditDebitDetails(items, user, creditNoteRef),
+    };
+
+    // Invoice linkage is optional — Sage accepts standalone credit notes.
+    if (orderNumber) {
+      payload.OrderNumber = orderNumber;
+    }
+    if (invoiceNumber) {
+      payload.InvoiceNumber = invoiceNumber;
     }
 
-    if (Array.isArray(payload?.value)) {
-      return payload.value[0] || null;
-    }
-
-    if (Array.isArray(payload)) {
-      return payload[0] || null;
-    }
-
-    return payload?.OrderNumber ? payload : null;
+    return payload;
   }
 
-  escapeODataString(value) {
-    return String(value).replace(/'/g, "''");
-  }
-
-  async findExistingCreditNoteOrder(orderReference) {
-    if (!orderReference) {
-      return null;
-    }
-
+  async postCreditDebitNote(creditDebitNote) {
     const { baseUrl, headers } = this.getAuthConfig();
-    console.log('[SageCreditNoteService] findExistingCreditNoteOrder:', {
-      orderReference,
-      url: `${baseUrl}/OE/OEOrders`,
+    const response = await axios.post(`${baseUrl}/${CREDIT_DEBIT_RESOURCE}`, creditDebitNote, {
+      headers,
       timeout: this.timeout,
     });
 
-    try {
-      const response = await axios.get(`${baseUrl}/OE/OEOrders`, {
-        headers,
-        params: {
-          $filter: `OrderReference eq '${this.escapeODataString(orderReference)}'`,
-          $top: 1,
-        },
-        timeout: this.timeout,
-      });
-
-      console.log('[SageCreditNoteService] findExistingCreditNoteOrder response status:', response.status);
-      return this.extractOrderEntity(response.data);
-    } catch (error) {
-      console.error('[SageCreditNoteService] findExistingCreditNoteOrder error:', {
-        orderReference,
-        message: error.message,
-        status: error.response?.status,
-        data: error.response?.data,
-      });
-      throw error;
-    }
+    return response.data;
   }
 
   async createCreditNoteReturn(creditNote, items, user, originalSale = null, options = {}) {
-    const { baseUrl, headers } = this.getAuthConfig();
-    const orderDate = creditNote?.credit_note_date || new Date().toISOString();
-    const orderReference = options.orderReference || this.buildOrderReference(creditNote, originalSale, orderDate);
-    const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || orderReference;
-    const sdcTag = creditNote?.sdcid ? ` | SDC:${creditNote.sdcid}` : '';
-    const invoiceTag = creditNote?.invoice_no ? ` | INV:${creditNote.invoice_no}` : '';
-    const orderDescription = `${creditNoteRef}${originalSale?.receipt_number ? ` / ${originalSale.receipt_number}` : ''}${sdcTag}${invoiceTag}`;
+    const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || `CN-${creditNote?.id}`;
+    const enrichedCreditNote = await this.resolveCreditNoteReferences(creditNote, options.syncModels || null);
 
-    if (options.reconcileExisting && orderReference) {
-      const existingOrder = await this.findExistingCreditNoteOrder(orderReference);
-      if (existingOrder) {
+    if (options.reconcileExisting) {
+      const existingNote = await this.findExistingCreditDebitNote(creditNoteRef);
+      if (existingNote) {
         return {
-          success: true,
-          status: 200,
-          data: existingOrder,
-          responseBody: existingOrder,
-          sageResponse: existingOrder,
-          documentNumber: existingOrder.OrderNumber || null,
-          documentUniquifier: existingOrder.OrderUniquifier == null ? null : String(existingOrder.OrderUniquifier),
-          documentReference: existingOrder.OrderReference || orderReference,
+          ...this.mapDispatchResult(existingNote, creditNoteRef),
           existingDocument: true,
         };
       }
     }
 
-    const orderDetails = this.buildOrderDetails(items, user, creditNoteRef);
-    const totalFromCreditNote = Number(creditNote?.total_amount || 0);
-    const fallbackFromLines = orderDetails.reduce((sum, detail) => (
-      sum + (Number(detail.OrderUnitPrice) * Number(detail.QuantityOrdered))
-    ), 0);
-    const orderTotal = this.to4(totalFromCreditNote || fallbackFromLines);
+    const creditDebitNote = this.buildCreditDebitNote(enrichedCreditNote, items, user, originalSale, {
+      date: options.date,
+      creditDebitNoteNumber: creditNoteRef,
+      orderNumber: enrichedCreditNote.sage_order_number,
+      invoiceNumber: enrichedCreditNote.sage_invoice_number,
+    });
 
-    const order = {
-      OrderUniquifier: 0,
-      OrderNumber: '*** NEW ***',
-      OrderReference: orderReference,
-      CustomerNumber: user?.store?.store_customer_number || creditNote?.customer?.customer_number || '1101',
-      CustomerGroupCode: user?.store?.currency || creditNote?.currency || 'ZMW',
-      ShipToName: creditNote?.customer?.name || user?.store?.store_location || 'POS Customer',
-      ShipToAddressLine1: '',
-      ShipToCity: '',
-      OrderDescription: orderDescription,
-      CustomerDiscountLevel: 'Base',
-      DefaultPriceListCode: user?.store?.price_list_code || '01',
-      TermsCode: user?.store?.terms_code || 'COD',
-      OrderType: 'Active',
-      OrderDate: new Date(orderDate).toISOString(),
-      ExpectedShipDate: new Date(orderDate).toISOString(),
-      OrderFiscalYear: String(new Date(orderDate).getUTCFullYear()),
-      OrderFiscalPeriod: `Num${new Date(orderDate).getUTCMonth() + 1}`,
-      DefaultLocationCode: user?.store?.store_number || '',
-      OnHold: false,
-      OrderHomeCurrency: user?.store?.currency || creditNote?.currency || 'ZMW',
-      OrderRateType: 'SP',
-      OrderSourceCurrency: user?.store?.currency || creditNote?.currency || 'ZMW',
-      OrderRateDate: new Date(orderDate).toISOString(),
-      OrderRate: 1,
-      OrderRateDateMatching: 3,
-      OrderRateOperator: 1,
-      OrderRateOverrideFlag: false,
-      TaxGroup: user?.store?.store_tax_group || 'VATZMW',
-      TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
-      TaxClass1: 1,
-      OrderCompleted: 'IncompleteNotIncluded',
-      PostInvoice: false,
-      TaxReportingTRCurrency: user?.store?.currency || creditNote?.currency || 'ZMW',
-      TRRateType: 'SP',
-      TRRateDate: new Date(orderDate).toISOString(),
-      TRRate: 1,
-      TRRateDateMatching: 1,
-      TRRateOperator: 1,
-      OrderDetails: orderDetails,
-      OrderTotal: orderTotal,
-      OrderInclTaxTotal: orderTotal,
-      NumberOfLinesOnOrder: orderDetails.length,
-      UpdateOperation: 'Unspecified',
-    };
-
-    console.log('[SageCreditNoteService] createCreditNoteReturn sending order:', {
-      orderReference,
-      url: `${baseUrl}/OE/OEOrders`,
-      OrderTotal: order.OrderTotal,
-      NumberOfLinesOnOrder: order.NumberOfLinesOnOrder,
-      timeout: this.timeout,
+    console.log('[SageCreditNoteService] createCreditNoteReturn posting:', {
+      creditNoteRef,
+      url: `${this.getAuthConfig().baseUrl}/${CREDIT_DEBIT_RESOURCE}`,
+      hasInvoice: Boolean(enrichedCreditNote.sage_invoice_number),
+      lineCount: creditDebitNote.CreditDebitDetails.length,
     });
 
     try {
-      const response = await axios.post(`${baseUrl}/OE/OEOrders`, order, {
-        headers,
-        timeout: this.timeout,
-      });
-
-      console.log('[SageCreditNoteService] createCreditNoteReturn response status:', response.status);
+      const entity = await this.postCreditDebitNote(creditDebitNote);
       return {
-        success: true,
-        status: response.status,
-        data: response.data,
-        responseBody: response.data,
-        sageResponse: response.data,
-        documentNumber: response.data?.OrderNumber || null,
-        documentUniquifier: response.data?.OrderUniquifier == null ? null : String(response.data.OrderUniquifier),
-        documentReference: response.data?.OrderReference || orderReference,
+        ...this.mapDispatchResult(entity, creditNoteRef),
         existingDocument: false,
       };
     } catch (error) {
       console.error('[SageCreditNoteService] createCreditNoteReturn error:', {
-        orderReference,
+        creditNoteRef,
         message: error.message,
         status: error.response?.status,
         data: error.response?.data,
@@ -261,159 +300,99 @@ class SageCreditNoteService {
     }
   }
 
-  // Builds a single consolidated OE credit-note document containing the line items of every
-  // credit note in the day's batch. Mirrors SageOrdersService.buildConsolidatedOrder so the
-  // batch posting behaves exactly like the consolidated sales day-end order.
-  buildConsolidatedCreditNote(creditNotes, user, date, orderReference, options = {}) {
-    const orderDate = date ? new Date(date).toISOString() : new Date().toISOString();
-    let detailIndex = 0;
-    const orderDetails = [];
+  // Posts each credit note in the daily batch as its own O/E Credit/Debit document.
+  // Idempotent per credit-note receipt number. Invoice linkage is optional.
+  async createConsolidatedCreditNoteReturn(creditNotes, user, date, options = {}) {
+    const perSaleDocuments = [];
+    let lastResult = null;
+    let postedCount = 0;
+    let existingCount = 0;
+    let failedCount = 0;
+    const errors = [];
+    const syncModels = options.syncModels || null;
 
-    for (const creditNote of creditNotes) {
+    for (const rawCreditNote of creditNotes) {
+      const creditNote = await this.resolveCreditNoteReferences(rawCreditNote, syncModels);
       const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || `CN-${creditNote?.id}`;
+      const items = creditNote.items || [];
 
-      for (const rawItem of (creditNote.items || [])) {
-        const item = this.normalizeItem(rawItem);
-        orderDetails.push({
-          LineNumber: (detailIndex + 1) * 32,
-          LineType: 'Item',
-          Item: item.code,
-          Description: `${creditNoteRef} - ${item.description}`,
-          Category: user?.store?.store_customer_number || '',
-          Location: user?.store?.store_number || '',
-          StockItem: true,
-          QuantityOrdered: item.quantity,
-          OrderUnitOfMeasure: 'EACH',
-          OrderUnitConversion: 1,
-          OrderUnitPrice: this.to4(item.unitPrice),
-          PriceOverride: true,
-          PricingUnitOfMeasure: 'EACH',
-          PricingUnitPrice: this.to4(item.unitPrice),
-          PricingUnitConversion: 1,
-          DetailNumber: detailIndex + 1,
-          TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
-          TaxClass1: 1,
-          TaxIncluded1: true,
-          UpdateOperation: 'Unspecified',
+      try {
+        let result;
+
+        if (options.reconcileExisting !== false) {
+          const existingNote = await this.findExistingCreditDebitNote(creditNoteRef);
+          if (existingNote) {
+            result = {
+              ...this.mapDispatchResult(existingNote, creditNoteRef),
+              existingDocument: true,
+            };
+            existingCount += 1;
+          }
+        }
+
+        if (!result) {
+          const creditDebitNote = this.buildCreditDebitNote(creditNote, items, creditNote.cashier || user, null, {
+            date: creditNote.sage_invoice_date || date,
+            creditDebitNoteNumber: creditNoteRef,
+            orderNumber: creditNote.sage_order_number,
+            invoiceNumber: creditNote.sage_invoice_number,
+          });
+
+          console.log('[SageCreditNoteService] createConsolidatedCreditNoteReturn posting:', {
+            creditNoteRef,
+            hasInvoice: Boolean(creditNote.sage_invoice_number),
+            lineCount: creditDebitNote.CreditDebitDetails.length,
+          });
+
+          const entity = await this.postCreditDebitNote(creditDebitNote);
+          result = {
+            ...this.mapDispatchResult(entity, creditNoteRef),
+            existingDocument: false,
+          };
+          postedCount += 1;
+        }
+
+        lastResult = result;
+        perSaleDocuments.push({
+          sale_id: String(creditNote.id),
+          receipt_number: creditNote.receipt_number || null,
+          document_number: result.documentNumber,
+          document_uniquifier: result.documentUniquifier,
+          sage_reference: result.documentReference,
+          existingDocument: result.existingDocument,
         });
-        detailIndex += 1;
+      } catch (error) {
+        failedCount += 1;
+        const errMsg = error?.response?.data?.error?.message?.value
+          || error?.response?.data?.error
+          || error.message;
+        errors.push({ creditNoteRef, error: errMsg });
+        console.error('[SageCreditNoteService] batch credit note failed:', {
+          creditNoteRef,
+          message: errMsg,
+          status: error.response?.status,
+        });
       }
     }
 
-    const totalFromCreditNotes = creditNotes.reduce((sum, creditNote) => sum + (Number(creditNote?.total_amount) || 0), 0);
-    const fallbackFromLines = orderDetails.reduce((sum, line) => sum + (Number(line.OrderUnitPrice) * Number(line.QuantityOrdered)), 0);
-    const orderTotal = this.to4(totalFromCreditNotes || fallbackFromLines);
-    const orderDescription = ['CN BATCH', options.branchId || '000', options.terminalId || '000', orderDate.slice(0, 10)].join(' ');
+    const success = failedCount === 0 && (postedCount > 0 || existingCount > 0);
 
     return {
-      OrderUniquifier: 0,
-      OrderNumber: '*** NEW ***',
-      OrderReference: orderReference || '',
-      CustomerNumber: user?.store?.store_customer_number || '1101',
-      CustomerGroupCode: user?.store?.currency || 'ZMW',
-      ShipToName: user?.store?.store_location || 'POS Customer',
-      ShipToAddressLine1: '',
-      ShipToCity: '',
-      OrderDescription: orderDescription,
-      CustomerDiscountLevel: 'Base',
-      DefaultPriceListCode: user?.store?.price_list_code || '01',
-      TermsCode: user?.store?.terms_code || 'COD',
-      OrderType: 'Active',
-      OrderDate: orderDate,
-      ExpectedShipDate: orderDate,
-      OrderFiscalYear: String(new Date(orderDate).getUTCFullYear()),
-      OrderFiscalPeriod: `Num${new Date(orderDate).getUTCMonth() + 1}`,
-      DefaultLocationCode: user?.store?.store_number || '',
-      OnHold: false,
-      OrderHomeCurrency: user?.store?.currency || 'ZMW',
-      OrderRateType: 'SP',
-      OrderSourceCurrency: user?.store?.currency || 'ZMW',
-      OrderRateDate: orderDate,
-      OrderRate: 1,
-      OrderRateDateMatching: 3,
-      OrderRateOperator: 1,
-      OrderRateOverrideFlag: false,
-      TaxGroup: user?.store?.store_tax_group || 'VATZMW',
-      TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
-      TaxClass1: 1,
-      OrderCompleted: 'IncompleteNotIncluded',
-      PostInvoice: false,
-      TaxReportingTRCurrency: user?.store?.currency || 'ZMW',
-      TRRateType: 'SP',
-      TRRateDate: orderDate,
-      TRRate: 1,
-      TRRateDateMatching: 1,
-      TRRateOperator: 1,
-      OrderDetails: orderDetails,
-      OrderTotal: orderTotal,
-      OrderInclTaxTotal: orderTotal,
-      NumberOfLinesOnOrder: orderDetails.length,
-      UpdateOperation: 'Unspecified',
+      success,
+      status: success ? 200 : 207,
+      postedCount,
+      existingCount,
+      failedCount,
+      creditNotesProcessed: creditNotes.length,
+      perSaleDocuments,
+      errors: errors.length > 0 ? errors : undefined,
+      documentNumber: lastResult?.documentNumber || null,
+      documentUniquifier: lastResult?.documentUniquifier || null,
+      documentReference: lastResult?.documentReference || null,
+      data: lastResult?.data || null,
+      responseBody: lastResult?.responseBody || null,
+      sageResponse: lastResult?.sageResponse || null,
     };
-  }
-
-  // Posts the consolidated daily credit-note batch as one OE credit-note document. Idempotent:
-  // if a document already exists for this batch reference it is reused instead of duplicated.
-  async createConsolidatedCreditNoteReturn(creditNotes, user, date, options = {}) {
-    const { baseUrl, headers } = this.getAuthConfig();
-    const orderReference = options.orderReference;
-    const order = this.buildConsolidatedCreditNote(creditNotes, user, date, orderReference, options);
-
-    if (orderReference) {
-      const existingOrder = await this.findExistingCreditNoteOrder(orderReference);
-      if (existingOrder) {
-        return {
-          success: true,
-          status: 200,
-          data: existingOrder,
-          responseBody: existingOrder,
-          sageResponse: existingOrder,
-          documentNumber: existingOrder.OrderNumber || null,
-          documentUniquifier: existingOrder.OrderUniquifier == null ? null : String(existingOrder.OrderUniquifier),
-          documentReference: existingOrder.OrderReference || orderReference,
-          existingDocument: true,
-          creditNotesProcessed: creditNotes.length,
-        };
-      }
-    }
-
-    console.log('[SageCreditNoteService] createConsolidatedCreditNoteReturn sending document:', {
-      orderReference,
-      url: `${baseUrl}/OE/OEOrders`,
-      OrderTotal: order.OrderTotal,
-      NumberOfLinesOnOrder: order.NumberOfLinesOnOrder,
-      creditNotes: creditNotes.length,
-      timeout: this.timeout,
-    });
-
-    try {
-      const response = await axios.post(`${baseUrl}/OE/OEOrders`, order, {
-        headers,
-        timeout: this.timeout,
-      });
-
-      console.log('[SageCreditNoteService] createConsolidatedCreditNoteReturn response status:', response.status);
-      return {
-        success: true,
-        status: response.status,
-        data: response.data,
-        responseBody: response.data,
-        sageResponse: response.data,
-        documentNumber: response.data?.OrderNumber || null,
-        documentUniquifier: response.data?.OrderUniquifier == null ? null : String(response.data.OrderUniquifier),
-        documentReference: response.data?.OrderReference || orderReference,
-        existingDocument: false,
-        creditNotesProcessed: creditNotes.length,
-      };
-    } catch (error) {
-      console.error('[SageCreditNoteService] createConsolidatedCreditNoteReturn error:', {
-        orderReference,
-        message: error.message,
-        status: error.response?.status,
-        data: error.response?.data,
-      });
-      throw error;
-    }
   }
 }
 
