@@ -21,6 +21,9 @@ async function main() {
   const testNumber = `CN-E2E-${Date.now()}`;
 
   const locationCode = process.argv[5] || invoice.DefaultLocationCode || '1304S';
+  const quantityReturned = Number(process.argv[6] || 1);
+  const unitPrice = Number(process.argv[4] || 10);
+  const lineAmount = Number((quantityReturned * unitPrice).toFixed(4));
 
   const payload = {
     CreditDebitNoteNumber: testNumber,
@@ -54,10 +57,12 @@ async function main() {
         Item: process.argv[3] || 'CP-11',
         Description: 'POS E2E credit note test line',
         Location: locationCode,
-        QuantityReturned: 1,
+        QuantityReturned: quantityReturned,
         CreditDebitNoteUOM: 'EACH',
         UnitConversion: 1,
-        UnitPrice: Number(process.argv[4] || 10),
+        UnitPrice: unitPrice,
+        LineAmount: lineAmount,
+        ExtendedPrice: lineAmount,
         PriceOverride: true,
         ReturnType: 'ItemsReturnedToInventory',
         TaxAuthority1: invoice.TaxAuthority1 || 'VATZMW',
