@@ -129,8 +129,10 @@ async function ensureReconIndexes() {
   const queryInterface = models.sequelize.getQueryInterface();
 
   const indexPlan = [
-    ['sync_events', ['event_type', 'received_at'], 'idx_sync_events_type_received'],
+    ['sync_events', ['event_type', 'received_at', 'id'], 'idx_sync_events_type_received_id'],
+    ['sync_events', ['status', 'received_at', 'id'], 'idx_sync_events_status_received_id'],
     ['sync_events', ['status'], 'idx_sync_events_status'],
+    ['sync_sale_exports', ['document_type', 'exported_at', 'id'], 'idx_sync_sale_exports_type_exported_id'],
     ['recon_audit_logs', ['occurred_at'], 'idx_recon_audit_logs_occurred_at'],
   ];
 

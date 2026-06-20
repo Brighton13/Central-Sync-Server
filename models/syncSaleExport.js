@@ -65,6 +65,7 @@ module.exports = (sequelize, DataTypes) => {
       { name: 'idx_sync_sale_exports_sync_event_id', fields: ['sync_event_id'] },
       { name: 'idx_sync_sale_exports_day_end_key', fields: ['day_end_idempotency_key'] },
       { name: 'idx_sync_sale_exports_sage_document_number', fields: ['sage_document_number'] },
+      { name: 'idx_sync_sale_exports_type_exported_id', fields: ['document_type', 'exported_at', 'id'] },
     ],
   });
 

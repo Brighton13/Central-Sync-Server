@@ -24,4 +24,22 @@ app.use('/api/customers', customerRoutes);
 app.use('/api/recon', reconciliationRoutes);
 app.use('/api/sync', syncRoutes);
 
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  const statusCode = Number(error.statusCode || error.status || 500);
+  if (statusCode >= 500) {
+    console.error('[http] unhandled request error', error);
+  }
+
+  return res.status(statusCode).json({
+    success: false,
+    code: error.code || 'INTERNAL_SERVER_ERROR',
+    message: statusCode >= 500 ? 'Internal server error' : error.message,
+    details: error.details,
+  });
+});
+
 module.exports = { app };

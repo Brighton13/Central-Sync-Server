@@ -95,6 +95,8 @@ module.exports = (sequelize, DataTypes) => {
       { name: 'idx_sync_events_status', fields: ['status'] },
       { name: 'idx_sync_events_event_type', fields: ['event_type'] },
       { name: 'idx_sync_events_store_id', fields: ['store_id'] },
+      { name: 'idx_sync_events_type_received_id', fields: ['event_type', 'received_at', 'id'] },
+      { name: 'idx_sync_events_status_received_id', fields: ['status', 'received_at', 'id'] },
     ]
   });
 

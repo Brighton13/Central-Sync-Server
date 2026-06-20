@@ -107,8 +107,15 @@ router.post('/events', syncAuth, async (req, res) => {
 
 router.get('/events', syncAuth, async (req, res) => {
   const models = req.app.locals.models;
-  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const requestedLimit = Number(req.query.limit || 10);
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 20)
+    : 10;
+  const includePayload = req.query.includePayload === 'true';
   const events = await models.syncEvent.findAll({
+    attributes: includePayload
+      ? undefined
+      : { exclude: ['payload', 'response_payload'] },
     order: [['id', 'DESC']],
     limit,
   });
@@ -116,6 +123,7 @@ router.get('/events', syncAuth, async (req, res) => {
   return res.json({
     success: true,
     count: events.length,
+    includePayload,
     events: events.map(serializeSyncEvent),
   });
 });

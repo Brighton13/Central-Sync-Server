@@ -41,21 +41,38 @@ async function queueSyncEvent(syncEvent) {
   return job;
 }
 
-async function recoverIncompleteEvents(models) {
-  const events = await models.syncEvent.findAll({
-    where: {
-      status: {
-        [Op.in]: ['received', 'queued', 'failed', 'dead_letter'],
-      },
-    },
-   // order: [['id', 'ASC']],
-  });
+async function recoverIncompleteEvents(models, queueEvent = queueSyncEvent) {
+  const batchSize = Math.min(Math.max(Number(process.env.SYNC_RECOVERY_BATCH_SIZE || 250), 1), 1000);
+  let lastId = 0;
+  let recoveredCount = 0;
 
-  for (const syncEvent of events) {
-    await queueSyncEvent(syncEvent);
+  while (true) {
+    const events = await models.syncEvent.findAll({
+      where: {
+        id: { [Op.gt]: lastId },
+        status: {
+          [Op.in]: ['received', 'queued', 'failed', 'dead_letter'],
+        },
+      },
+      attributes: ['id', 'event_type', 'status'],
+      order: [['id', 'ASC']],
+      limit: batchSize,
+    });
+
+    if (events.length === 0) {
+      break;
+    }
+
+    for (const syncEvent of events) {
+      await queueEvent(syncEvent);
+      lastId = syncEvent.id;
+      recoveredCount += 1;
+    }
+
+    console.log(`[syncRecovery] recovered ${recoveredCount} event(s); lastId=${lastId}`);
   }
 
-  return events.length;
+  return recoveredCount;
 }
 
 module.exports = {

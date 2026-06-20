@@ -38,6 +38,20 @@ Collects sync events from multiple POS backends, persists them with idempotency 
 - `POST /api/sync/events`
 - `GET /api/sync/events`
 
+`GET /api/sync/events` omits large event and response payloads by default. Pass
+`includePayload=true` only for focused diagnostics; the endpoint is capped at 20 rows.
+
+## Production data-volume safeguards
+
+- Incomplete events are recovered with keyset pagination in batches controlled by
+  `SYNC_RECOVERY_BATCH_SIZE` (default `250`).
+- Reconciliation requests are rejected with HTTP `413` before loading data when their
+  raw event payload exceeds `RECON_MAX_PAYLOAD_BYTES` (default `64 MiB`). Use a shorter
+  date range when this occurs.
+- Database pool sizing is controlled by `DB_POOL_MAX`, `DB_POOL_MIN`,
+  `DB_POOL_ACQUIRE_MS`, and `DB_POOL_IDLE_MS`.
+- Required reconciliation range indexes are installed idempotently during startup.
+
 ## Auth
 
 If `SYNC_SERVER_TOKEN` is set, requests must send:

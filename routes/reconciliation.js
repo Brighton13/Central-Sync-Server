@@ -1,5 +1,5 @@
 const express = require('express');
-const { Op } = require('sequelize');
+const { Op, col, fn } = require('sequelize');
 const ExcelJS = require('exceljs');
 
 const { reconAuth, requireReconRole } = require('../middleware/reconAuth');
@@ -27,6 +27,47 @@ const STATUS_BUCKETS = {
   queued: 'pending',
   received: 'pending',
 };
+const DEFAULT_MAX_RECON_PAYLOAD_BYTES = 64 * 1024 * 1024;
+
+function getMaxReconPayloadBytes() {
+  const configured = Number(process.env.RECON_MAX_PAYLOAD_BYTES || DEFAULT_MAX_RECON_PAYLOAD_BYTES);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_MAX_RECON_PAYLOAD_BYTES;
+}
+
+function createPayloadBudgetError(payloadBytes, eventCount, maxPayloadBytes) {
+  const error = new Error(
+    `Requested range contains ${eventCount} batches and ${Math.ceil(payloadBytes / 1024 / 1024)} MB of raw payload data. `
+      + 'Choose a shorter date range while historical reporting is being optimized.'
+  );
+  error.statusCode = 413;
+  error.code = 'RECON_PAYLOAD_LIMIT_EXCEEDED';
+  error.details = { payloadBytes, eventCount, maxPayloadBytes };
+  return error;
+}
+
+async function assertEventPayloadWithinBudget(models, eventTypes, dateRange) {
+  const where = {
+    event_type: Array.isArray(eventTypes) ? { [Op.in]: eventTypes } : eventTypes,
+    received_at: buildRangeWhere(dateRange),
+  };
+  const totals = await models.syncEvent.findOne({
+    attributes: [
+      [fn('COUNT', col('id')), 'eventCount'],
+      [fn('COALESCE', fn('SUM', fn('OCTET_LENGTH', col('payload'))), 0), 'payloadBytes'],
+    ],
+    where,
+    raw: true,
+  });
+  const eventCount = Number(totals?.eventCount || 0);
+  const payloadBytes = Number(totals?.payloadBytes || 0);
+  const maxPayloadBytes = getMaxReconPayloadBytes();
+
+  if (payloadBytes > maxPayloadBytes) {
+    throw createPayloadBudgetError(payloadBytes, eventCount, maxPayloadBytes);
+  }
+}
 
 function parseNumber(value) {
   const parsed = Number(value);
@@ -763,22 +804,28 @@ function buildCreditNoteRow(syncEvent, creditNote, creditNoteExportRows) {
   };
 }
 
-async function loadEventsWithExports(models, eventTypes, dateRange) {
+async function loadEventsWithExports(models, eventTypes, dateRange, options = {}) {
   console.log('[reconciliation] loadEventsWithExports start', {
     eventTypes,
     startDate: dateRange.startDate,
     endDate: dateRange.endDate,
   });
 
+  await assertEventPayloadWithinBudget(models, eventTypes, dateRange);
+
   const events = await models.syncEvent.findAll({
     where: {
       event_type: Array.isArray(eventTypes) ? { [Op.in]: eventTypes } : eventTypes,
       received_at: buildRangeWhere(dateRange),
     },
+    attributes: { exclude: ['response_payload'] },
   });
 
   const plainEvents = events.map((event) => (event.toJSON ? event.toJSON() : event));
-  const eventIds = plainEvents.map((event) => event.id);
+  const exportEvents = options.exportEventLimit
+    ? sortByIdDesc(plainEvents).slice(0, options.exportEventLimit)
+    : plainEvents;
+  const eventIds = exportEvents.map((event) => event.id);
   const saleExports = eventIds.length > 0
     ? await models.syncSaleExport.findAll({
         where: { sync_event_id: { [Op.in]: eventIds } },
@@ -929,29 +976,39 @@ async function loadCreditNoteExports(models, events) {
   return lookup;
 }
 
-async function loadExportsWithEvents(models, dateRange) {
+async function loadExportsWithEvents(models, dateRange, limit) {
   console.log('[reconciliation] loadExportsWithEvents start', {
     startDate: dateRange.startDate,
     endDate: dateRange.endDate,
   });
 
-  const exports = await models.syncSaleExport.findAll({
-    where: {
-      document_type: 'oe_order',
-      exported_at: buildRangeWhere(dateRange),
-    },
-  });
+  const where = {
+    document_type: 'oe_order',
+    exported_at: buildRangeWhere(dateRange),
+  };
+  const [exportCount, exports] = await Promise.all([
+    models.syncSaleExport.count({ where }),
+    models.syncSaleExport.findAll({
+      where,
+      order: [['id', 'DESC']],
+      limit,
+      raw: true,
+    }),
+  ]);
 
   const plainExports = exports.map((row) => (row.toJSON ? row.toJSON() : row));
   const eventIds = Array.from(new Set(plainExports.map((row) => row.sync_event_id).filter(Boolean)));
   const events = eventIds.length > 0
     ? await models.syncEvent.findAll({
         where: { id: { [Op.in]: eventIds } },
+        attributes: ['id', 'store_id', 'payload', 'received_at'],
+        raw: true,
       })
     : [];
 
   console.log('[reconciliation] loadExportsWithEvents loaded', {
-    exportCount: plainExports.length,
+    exportCount,
+    loadedExportCount: plainExports.length,
     linkedEventCount: events.length,
   });
 
@@ -964,6 +1021,7 @@ async function loadExportsWithEvents(models, dateRange) {
 
   return {
     exports: plainExports,
+    exportCount,
     eventMap,
   };
 }
@@ -977,10 +1035,12 @@ router.get('/summary', reconAuth, async (req, res) => {
     dateRange,
     limit,
   });
-  const events = await loadEventsWithExports(models, RELEVANT_EVENT_TYPES, dateRange);
+  const events = await loadEventsWithExports(models, RELEVANT_EVENT_TYPES, dateRange, {
+    exportEventLimit: limit,
+  });
   const recentBatchRows = sortByIdDesc(events).slice(0, limit);
-  const exportBundle = await loadExportsWithEvents(models, dateRange);
-  const recentExports = sortByIdDesc(exportBundle.exports).slice(0, limit * 2);
+  const exportBundle = await loadExportsWithEvents(models, dateRange, limit * 2);
+  const recentExports = exportBundle.exports;
   const exportLookup = await loadExportsForSales(models, events);
 
   const branchPerformance = new Map();
@@ -1103,8 +1163,8 @@ router.get('/summary', reconAuth, async (req, res) => {
     });
   }
 
-  if (exportBundle.exports.length > 0) {
-    documentSummary.oe_order = exportBundle.exports.length;
+  if (exportBundle.exportCount > 0) {
+    documentSummary.oe_order = exportBundle.exportCount;
   }
 
   const totalSalesCount = uniqueSales.size;
@@ -1630,7 +1690,12 @@ router.get('/sales/export', reconAuth, async (req, res) => {
     return res.end();
   } catch (error) {
     console.error('[reconciliation] /sales/export failed', error);
-    return res.status(500).json({ success: false, message: error.message || 'Failed to generate sales report' });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      code: error.code || 'SALES_EXPORT_FAILED',
+      message: error.message || 'Failed to generate sales report',
+      details: error.details,
+    });
   }
 });
 
@@ -1903,7 +1968,12 @@ router.get('/credit-notes/export', reconAuth, async (req, res) => {
     return res.end();
   } catch (error) {
     console.error('[reconciliation] /credit-notes/export failed', error);
-    return res.status(500).json({ success: false, message: error.message || 'Failed to generate credit note report' });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      code: error.code || 'CREDIT_NOTE_EXPORT_FAILED',
+      message: error.message || 'Failed to generate credit note report',
+      details: error.details,
+    });
   }
 });
 
