@@ -105,6 +105,9 @@ module.exports = (sequelize, DataTypes) => {
       foreignKey: 'sync_event_id',
       as: 'saleExports',
     });
+    syncEvent.hasOne(models.reconBatch, { foreignKey: 'sync_event_id', as: 'reconBatch' });
+    syncEvent.hasMany(models.reconSale, { foreignKey: 'sync_event_id', as: 'reconSales' });
+    syncEvent.hasMany(models.reconCreditNote, { foreignKey: 'sync_event_id', as: 'reconCreditNotes' });
   };
 
   return syncEvent;

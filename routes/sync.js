@@ -1,6 +1,7 @@
 const express = require('express');
 const syncAuth = require('../middleware/syncAuth');
 const { queueSyncEvent, SAGE_DISPATCH_QUEUE } = require('../services/syncEventQueueService');
+const { materializeSyncEvent } = require('../services/reconciliationProjectionService');
 
 const router = express.Router();
 
@@ -48,21 +49,27 @@ router.post('/events', syncAuth, async (req, res) => {
   const models = req.app.locals.models;
   const payload = req.body;
 
-  const [syncEvent, created] = await models.syncEvent.findOrCreate({
-    where: { idempotency_key: payload.idempotency_key },
-    defaults: {
-      event_type: payload.event_type,
-      aggregate_type: payload.aggregate_type,
-      aggregate_id: String(payload.aggregate_id),
-      store_id: Number(payload.store_id),
-      user_id: payload.user_id == null ? null : Number(payload.user_id),
-      receipt_number: payload.receipt_number || null,
-      idempotency_key: payload.idempotency_key,
-      payload: payload.payload,
-      status: 'received',
-      source_system: payload.source_system || 'pos-backend',
-      received_at: new Date(),
-    }
+  const [syncEvent, created] = await models.sequelize.transaction(async (transaction) => {
+    const result = await models.syncEvent.findOrCreate({
+      where: { idempotency_key: payload.idempotency_key },
+      defaults: {
+        event_type: payload.event_type,
+        aggregate_type: payload.aggregate_type,
+        aggregate_id: String(payload.aggregate_id),
+        store_id: Number(payload.store_id),
+        user_id: payload.user_id == null ? null : Number(payload.user_id),
+        receipt_number: payload.receipt_number || null,
+        idempotency_key: payload.idempotency_key,
+        payload: payload.payload,
+        status: 'received',
+        source_system: payload.source_system || 'pos-backend',
+        received_at: new Date(),
+      },
+      transaction,
+    });
+
+    await materializeSyncEvent(models, result[0], { transaction, advanceState: true });
+    return result;
   });
 
   if (!created) {

@@ -52,6 +52,16 @@ Collects sync events from multiple POS backends, persists them with idempotency 
   `DB_POOL_ACQUIRE_MS`, and `DB_POOL_IDLE_MS`.
 - Required reconciliation range indexes are installed idempotently during startup.
 
+### Normalized reconciliation projection
+
+Dashboard summaries and the sales, credit-note, and batch registers read from compact
+`recon_batches`, `recon_sales`, and `recon_credit_notes` tables. New sync events update
+these tables in the same transaction as ingestion. On the first upgraded startup, an
+idempotent background backfill processes historical event JSON in batches controlled by
+`RECON_BACKFILL_BATCH_SIZE` (default `25`). Reconciliation endpoints return HTTP `503`
+until that first backfill is complete, while event ingestion and Sage processing remain
+available.
+
 ## Auth
 
 If `SYNC_SERVER_TOKEN` is set, requests must send:

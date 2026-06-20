@@ -27,6 +27,7 @@ const STATUS_BUCKETS = {
   queued: 'pending',
   received: 'pending',
 };
+const RECON_PROJECTION_NAME = 'reconciliation-v1';
 const DEFAULT_MAX_RECON_PAYLOAD_BYTES = 64 * 1024 * 1024;
 
 function getMaxReconPayloadBytes() {
@@ -67,6 +68,17 @@ async function assertEventPayloadWithinBudget(models, eventTypes, dateRange) {
   if (payloadBytes > maxPayloadBytes) {
     throw createPayloadBudgetError(payloadBytes, eventCount, maxPayloadBytes);
   }
+}
+
+async function assertProjectionReady(models) {
+  const state = await models.reconProjectionState.findByPk(RECON_PROJECTION_NAME, { raw: true });
+  if (state?.is_backfilled) return;
+
+  const error = new Error('Reconciliation history is being prepared. Please retry shortly.');
+  error.statusCode = 503;
+  error.code = 'RECON_PROJECTION_BACKFILL_IN_PROGRESS';
+  error.details = { lastEventId: Number(state?.last_event_id || 0) };
+  throw error;
 }
 
 function parseNumber(value) {
@@ -1028,6 +1040,196 @@ async function loadExportsWithEvents(models, dateRange, limit) {
 
 router.get('/summary', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
+  await assertProjectionReady(models);
+  const limit = parseLimit(req.query.limit);
+  const dateRange = buildDateRange(req.query);
+  const batchWhere = {
+    event_type: { [Op.in]: RELEVANT_EVENT_TYPES },
+    received_at: projectionDateWhere(dateRange),
+  };
+  const saleWhere = { sale_date: projectionDateWhere(dateRange) };
+  const creditWhere = { credit_note_date: projectionDateWhere(dateRange) };
+
+  const [batchRecords, totalSalesCount, postedSalesCount, totalSalesValue, totalCreditNotesCount,
+    totalCreditNotesValue, saleGroups, recentProjectionExports] = await Promise.all([
+    models.reconBatch.findAll({
+      where: batchWhere,
+      include: [{
+        model: models.syncEvent,
+        as: 'syncEvent',
+        attributes: PROJECTION_EVENT_ATTRIBUTES,
+        required: true,
+      }],
+      order: [['received_at', 'DESC'], ['sync_event_id', 'DESC']],
+    }),
+    models.reconSale.count({ where: saleWhere }),
+    models.reconSale.count({ where: { ...saleWhere, posted_to_sage: true } }),
+    models.reconSale.sum('total_amount', { where: saleWhere }),
+    models.reconCreditNote.count({ where: creditWhere }),
+    models.reconCreditNote.sum('total_amount', { where: creditWhere }),
+    models.reconSale.findAll({
+      attributes: [
+        'branch_id',
+        'terminal_id',
+        [fn('COUNT', col('id')), 'sales_count'],
+        [fn('SUM', col('total_amount')), 'total_amount'],
+        [fn('SUM', col('posted_to_sage')), 'posted_count'],
+      ],
+      where: saleWhere,
+      group: ['branch_id', 'terminal_id'],
+      raw: true,
+    }),
+    models.reconSale.findAll({
+      where: {
+        posted_to_sage: true,
+        exported_at: projectionDateWhere(dateRange),
+      },
+      order: [['exported_at', 'DESC'], ['id', 'DESC']],
+      limit: limit * 2,
+      raw: true,
+    }),
+  ]);
+
+  const batches = batchRecords.map((record) => record.toJSON());
+  const recentBatches = batches.slice(0, limit);
+  const recentEventIds = recentBatches.map((batch) => batch.sync_event_id);
+  const recentBatchExports = recentEventIds.length > 0
+    ? await models.syncSaleExport.findAll({
+        where: { sync_event_id: { [Op.in]: recentEventIds } },
+        raw: true,
+      })
+    : [];
+  const exportsByEvent = groupExportsByEventId(recentBatchExports);
+  const branchPerformance = new Map();
+  const terminalPerformance = new Map();
+  const documentSummary = {};
+  let completedBatches = 0;
+  let pendingBatches = 0;
+  let failedBatches = 0;
+
+  for (const batch of batches) {
+    const syncEvent = projectionEvent(batch);
+    const bucket = toStatusBucket(syncEvent.status);
+    if (bucket === 'completed') completedBatches += 1;
+    else if (bucket === 'failed') failedBatches += 1;
+    else pendingBatches += 1;
+    incrementDocumentCounter(documentSummary, batch.event_type, Number(batch.transaction_count || 0));
+
+    const branchId = batch.branch_id || 'Unassigned';
+    const terminalId = batch.terminal_id || 'Unassigned';
+    const branch = upsertPerformanceBucket(branchPerformance, String(branchId), `Branch ${branchId}`);
+    const terminal = upsertPerformanceBucket(terminalPerformance, `${branchId}:${terminalId}`, `Terminal ${terminalId}`);
+    branch.branchId = String(branchId);
+    terminal.branchId = String(branchId);
+    terminal.terminalId = String(terminalId);
+    branch.batches += 1;
+    terminal.batches += 1;
+    if (bucket === 'completed') {
+      branch.completedBatches += 1;
+      terminal.completedBatches += 1;
+    } else if (bucket === 'failed') {
+      branch.failedBatches += 1;
+      terminal.failedBatches += 1;
+    } else {
+      branch.pendingBatches += 1;
+      terminal.pendingBatches += 1;
+    }
+  }
+
+  for (const group of saleGroups) {
+    const branchId = group.branch_id || 'Unassigned';
+    const terminalId = group.terminal_id || 'Unassigned';
+    const salesCount = Number(group.sales_count || 0);
+    const postedCount = Number(group.posted_count || 0);
+    const amount = roundCurrency(group.total_amount);
+    const branch = upsertPerformanceBucket(branchPerformance, String(branchId), `Branch ${branchId}`);
+    const terminal = upsertPerformanceBucket(terminalPerformance, `${branchId}:${terminalId}`, `Terminal ${terminalId}`);
+    branch.branchId = String(branchId);
+    terminal.branchId = String(branchId);
+    terminal.terminalId = String(terminalId);
+    for (const target of [branch, terminal]) {
+      target.salesCount += salesCount;
+      target.postedSalesCount += postedCount;
+      target.pendingSalesCount += Math.max(salesCount - postedCount, 0);
+      target.totalAmount = roundCurrency(target.totalAmount + amount);
+    }
+  }
+
+  documentSummary.oe_order = postedSalesCount;
+  const batchRows = recentBatches.map((batch) => {
+    const syncEvent = projectionEvent(batch);
+    const eventExports = exportsByEvent.get(batch.sync_event_id) || [];
+    const references = Array.from(new Set(eventExports.map((row) => row.sage_reference).filter(Boolean)));
+    return {
+      id: batch.sync_event_id,
+      eventType: batch.event_type,
+      label: EVENT_TYPE_LABELS[batch.event_type] || batch.event_type,
+      status: syncEvent.status,
+      statusBucket: toStatusBucket(syncEvent.status),
+      storeId: batch.store_id,
+      branchId: batch.branch_id || 'Unassigned',
+      terminalId: batch.terminal_id || 'Unassigned',
+      transactionCount: Number(batch.transaction_count || 0),
+      totalAmount: roundCurrency(batch.total_amount),
+      creditNoteCount: Number(batch.credit_note_count || 0),
+      creditNoteTotal: roundCurrency(batch.credit_note_total),
+      exportedCount: eventExports.length,
+      receivedAt: batch.received_at,
+      processedAt: syncEvent.processed_at,
+      lastAttemptAt: syncEvent.last_attempt_at,
+      retryCount: syncEvent.retry_count,
+      idempotencyKey: syncEvent.idempotency_key,
+      sageReferences: references.slice(0, 3),
+      lastError: syncEvent.last_error,
+    };
+  });
+
+  return res.json({
+    success: true,
+    generatedAt: new Date().toISOString(),
+    filters: {
+      days: dateRange.days,
+      startDate: dateRange.startDate,
+      endDate: dateRange.endDate,
+      limit,
+      branchOptions: collectOptions(batches.map((batch) => batch.branch_id)),
+      terminalOptions: collectOptions(batches.map((batch) => batch.terminal_id)),
+    },
+    summary: {
+      totalBatches: batches.length,
+      completedBatches,
+      pendingBatches,
+      failedBatches,
+      totalSalesCount,
+      postedSalesCount,
+      pendingSalesCount: Math.max(totalSalesCount - postedSalesCount, 0),
+      totalSalesValue: roundCurrency(totalSalesValue),
+      totalCreditNotesCount,
+      totalCreditNotesValue: roundCurrency(totalCreditNotesValue),
+      documentSummary,
+    },
+    branchPerformance: Array.from(branchPerformance.values()).sort((left, right) => right.totalAmount - left.totalAmount),
+    terminalPerformance: Array.from(terminalPerformance.values()).sort((left, right) => right.totalAmount - left.totalAmount),
+    recentBatches: batchRows,
+    recentExports: recentProjectionExports.map((sale) => ({
+      id: sale.id,
+      saleId: String(sale.sale_id),
+      receiptNumber: sale.receipt_number || null,
+      branchId: sale.branch_id || 'Unassigned',
+      terminalId: sale.terminal_id || 'Unassigned',
+      documentType: 'oe_order',
+      sageDocumentNumber: sale.sage_document_number,
+      sageDocumentUniquifier: null,
+      sageReference: sale.sage_reference,
+      saleAmount: roundCurrency(sale.total_amount),
+      paymentMethod: sale.payment_method || null,
+      exportedAt: sale.exported_at,
+    })),
+  });
+});
+
+router.get('/summary-legacy', reconAuth, async (req, res) => {
+  const models = req.app.locals.models;
   const limit = parseLimit(req.query.limit);
   const dateRange = buildDateRange(req.query);
   console.log('[reconciliation] /summary request', {
@@ -1977,8 +2179,91 @@ router.get('/credit-notes/export', reconAuth, async (req, res) => {
   }
 });
 
+function projectionDateWhere(dateRange) {
+  return { [Op.between]: [dateRange.since, dateRange.until] };
+}
+
+function projectionWhere(dateField, dateRange, filters = {}) {
+  const where = { [dateField]: projectionDateWhere(dateRange) };
+  if (filters.branchId) where.branch_id = String(filters.branchId);
+  if (filters.terminalId) where.terminal_id = String(filters.terminalId);
+  return where;
+}
+
+function batchStatusWhere(status) {
+  if (status === 'completed') return 'completed';
+  if (status === 'failed') return { [Op.in]: ['failed', 'dead_letter'] };
+  if (status === 'pending') return { [Op.in]: ['received', 'queued', 'processing'] };
+  return undefined;
+}
+
+function databasePagination(total, requestedPage, pageSize) {
+  const totalPages = Math.max(Math.ceil(total / pageSize), 1);
+  const page = Math.min(requestedPage, totalPages);
+  return { page, pageSize, total, totalPages, offset: (page - 1) * pageSize };
+}
+
+async function loadProjectionOptions(model, dateField, dateRange, extraWhere = {}) {
+  const where = { ...extraWhere, [dateField]: projectionDateWhere(dateRange) };
+  const [branches, terminals] = await Promise.all([
+    model.findAll({
+      attributes: ['branch_id'],
+      where: { ...where, branch_id: { [Op.ne]: null } },
+      group: ['branch_id'],
+      raw: true,
+    }),
+    model.findAll({
+      attributes: ['terminal_id'],
+      where: { ...where, terminal_id: { [Op.ne]: null } },
+      group: ['terminal_id'],
+      raw: true,
+    }),
+  ]);
+  return {
+    branchOptions: collectOptions(branches.map((row) => row.branch_id)),
+    terminalOptions: collectOptions(terminals.map((row) => row.terminal_id)),
+  };
+}
+
+async function loadProjectionExports(models, rows, documentType, localIdField) {
+  const receiptNumbers = rows.map((row) => row.receipt_number).filter(Boolean).map(String);
+  const fallbackByStore = new Map();
+  for (const row of rows) {
+    if (row.receipt_number || row[localIdField] == null) continue;
+    const ids = fallbackByStore.get(row.store_id) || [];
+    ids.push(String(row[localIdField]));
+    fallbackByStore.set(row.store_id, ids);
+  }
+
+  const orConditions = [];
+  if (receiptNumbers.length > 0) orConditions.push({ receipt_number: { [Op.in]: receiptNumbers } });
+  for (const [storeId, ids] of fallbackByStore) {
+    orConditions.push({ store_id: storeId, sale_id: { [Op.in]: ids } });
+  }
+  if (orConditions.length === 0) return new Map();
+
+  const exports = await models.syncSaleExport.findAll({
+    where: { document_type: documentType, [Op.or]: orConditions },
+    raw: true,
+  });
+  return new Map(exports.map((row) => [
+    saleIdentityKey(row.store_id, row.receipt_number, row.sale_id),
+    row,
+  ]));
+}
+
+function projectionEvent(row) {
+  return row.syncEvent?.toJSON ? row.syncEvent.toJSON() : row.syncEvent;
+}
+
+const PROJECTION_EVENT_ATTRIBUTES = [
+  'id', 'status', 'received_at', 'processed_at', 'last_attempt_at',
+  'retry_count', 'idempotency_key', 'last_error',
+];
+
 router.get('/sales', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
+  await assertProjectionReady(models);
   const page = parsePage(req.query.page);
   const pageSize = parseLimit(req.query.pageSize || req.query.limit || 20);
   const dateRange = buildDateRange(req.query);
@@ -1993,47 +2278,54 @@ router.get('/sales', reconAuth, async (req, res) => {
     pageSize,
     filters,
   });
-
-  const events = await loadEventsWithExports(models, SALES_EVENT_TYPE, dateRange);
-  const branchOptions = collectOptions(events.map((event) => getBranchId(event)));
-  const terminalOptions = collectOptions(events.map((event) => getTerminalId(event)));
-  const exportLookup = await loadExportsForSales(models, events);
-  const rows = [];
-
-  for (const syncEvent of events) {
-    if (!eventMatchesFilters(syncEvent, filters)) {
-      continue;
-    }
-
-    const saleExportsBySaleId = groupExportsBySaleId(syncEvent.saleExports || []);
-
-    for (const sale of getSales(syncEvent)) {
-      const globalExport = exportLookup.get(saleIdentityKey(syncEvent.store_id, sale.receipt_number, sale.id));
-      const eventScopedExports = saleExportsBySaleId.get(String(sale.id)) || [];
-      const saleExportRows = globalExport ? [globalExport] : eventScopedExports;
-      const row = buildSaleRow(syncEvent, sale, saleExportRows);
-      if (!isDateInRange(row.saleDate, dateRange)) {
-        continue;
-      }
-      rows.push(row);
-    }
-  }
-
-  const orderedRows = rows.sort((left, right) => {
-    if (right.syncEventId !== left.syncEventId) {
-      return right.syncEventId - left.syncEventId;
-    }
-
-    return Number(right.saleId) - Number(left.saleId);
+  const where = projectionWhere('sale_date', dateRange, filters);
+  const total = await models.reconSale.count({ where });
+  const pagination = databasePagination(total, page, pageSize);
+  const saleRecords = await models.reconSale.findAll({
+    where,
+    include: [{
+      model: models.syncEvent,
+      as: 'syncEvent',
+      attributes: PROJECTION_EVENT_ATTRIBUTES,
+      required: true,
+    }],
+    order: [['sync_event_id', 'DESC'], ['id', 'DESC']],
+    limit: pageSize,
+    offset: pagination.offset,
   });
-
-  console.log('[reconciliation] /sales prepared rows', {
-    totalRows: rows.length,
-    page,
-    pageSize,
+  const plainSales = saleRecords.map((record) => record.toJSON());
+  const exportLookup = await loadProjectionExports(models, plainSales, 'oe_order', 'sale_id');
+  const rows = plainSales.map((sale) => {
+    const syncEvent = projectionEvent(sale);
+    const document = exportLookup.get(sale.identity_key) || null;
+    const documents = { oe_order: document };
+    return {
+      id: `${sale.sync_event_id}:${sale.sale_id}`,
+      syncEventId: sale.sync_event_id,
+      saleId: String(sale.sale_id),
+      receiptNumber: sale.receipt_number || null,
+      branchId: sale.branch_id || 'Unassigned',
+      terminalId: sale.terminal_id || 'Unassigned',
+      storeId: sale.store_id,
+      saleDate: sale.sale_date,
+      batchReceivedAt: syncEvent.received_at,
+      amount: roundCurrency(sale.total_amount),
+      paymentMethod: sale.payment_method || null,
+      batchStatus: syncEvent.status,
+      batchStatusBucket: toStatusBucket(syncEvent.status),
+      oeOrderNumber: document?.sage_document_number || null,
+      sageReference: document?.sage_reference || null,
+      documentsPosted: document ? 1 : 0,
+      postedToSage: Boolean(document),
+      pendingReason: buildSalePendingReason(syncEvent, documents),
+      batchProcessedAt: syncEvent.processed_at,
+      batchLastAttemptAt: syncEvent.last_attempt_at,
+      batchRetryCount: syncEvent.retry_count,
+      batchIdempotencyKey: syncEvent.idempotency_key,
+      batchLastError: syncEvent.last_error || null,
+    };
   });
-
-  const paginated = paginateRows(orderedRows, page, pageSize);
+  const options = await loadProjectionOptions(models.reconSale, 'sale_date', dateRange);
 
   return res.json({
     success: true,
@@ -2043,16 +2335,22 @@ router.get('/sales', reconAuth, async (req, res) => {
       endDate: dateRange.endDate,
       branchId: filters.branchId || null,
       terminalId: filters.terminalId || null,
-      branchOptions,
-      terminalOptions,
+      branchOptions: options.branchOptions,
+      terminalOptions: options.terminalOptions,
     },
-    pagination: paginated.pagination,
-    rows: paginated.rows,
+    pagination: {
+      page: pagination.page,
+      pageSize: pagination.pageSize,
+      total: pagination.total,
+      totalPages: pagination.totalPages,
+    },
+    rows,
   });
 });
 
 router.get('/credit-notes', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
+  await assertProjectionReady(models);
   const page = parsePage(req.query.page);
   const pageSize = parseLimit(req.query.pageSize || req.query.limit || 20);
   const dateRange = buildDateRange(req.query);
@@ -2061,41 +2359,58 @@ router.get('/credit-notes', reconAuth, async (req, res) => {
     terminalId: req.query.terminalId || '',
   };
   console.log('[reconciliation] /credit-notes request', { query: req.query, dateRange, page, pageSize, filters });
-
-  const events = await loadEventsWithExports(models, CREDIT_NOTE_BATCH_EVENT_TYPE, dateRange);
-  const branchOptions = collectOptions(events.map((event) => getBranchId(event)));
-  const terminalOptions = collectOptions(events.map((event) => getTerminalId(event)));
-  const exportLookup = await loadCreditNoteExports(models, events);
-  const rows = [];
-
-  for (const syncEvent of events) {
-    if (!eventMatchesFilters(syncEvent, filters)) {
-      continue;
-    }
-
-    const exportsBySaleId = groupExportsBySaleId(syncEvent.saleExports || []);
-
-    for (const creditNote of getCreditNotes(syncEvent)) {
-      const globalExport = exportLookup.get(saleIdentityKey(syncEvent.store_id, creditNote.receipt_number, creditNote.id));
-      const eventScopedExports = exportsBySaleId.get(String(creditNote.id)) || [];
-      const creditNoteExportRows = globalExport ? [globalExport] : eventScopedExports;
-      const row = buildCreditNoteRow(syncEvent, creditNote, creditNoteExportRows);
-      if (!isDateInRange(row.creditNoteDate, dateRange)) {
-        continue;
-      }
-      rows.push(row);
-    }
-  }
-
-  const orderedRows = rows.sort((left, right) => {
-    if (right.syncEventId !== left.syncEventId) {
-      return right.syncEventId - left.syncEventId;
-    }
-
-    return Number(right.creditNoteId) - Number(left.creditNoteId);
+  const where = projectionWhere('credit_note_date', dateRange, filters);
+  const total = await models.reconCreditNote.count({ where });
+  const pagination = databasePagination(total, page, pageSize);
+  const noteRecords = await models.reconCreditNote.findAll({
+    where,
+    include: [{
+      model: models.syncEvent,
+      as: 'syncEvent',
+      attributes: PROJECTION_EVENT_ATTRIBUTES,
+      required: true,
+    }],
+    order: [['sync_event_id', 'DESC'], ['id', 'DESC']],
+    limit: pageSize,
+    offset: pagination.offset,
   });
-
-  const paginated = paginateRows(orderedRows, page, pageSize);
+  const plainNotes = noteRecords.map((record) => record.toJSON());
+  const exportLookup = await loadProjectionExports(models, plainNotes, 'oe_credit_note', 'credit_note_id');
+  const rows = plainNotes.map((note) => {
+    const syncEvent = projectionEvent(note);
+    const document = exportLookup.get(note.identity_key) || null;
+    const posted = Boolean(document);
+    return {
+      id: `${note.sync_event_id}:${note.credit_note_id}`,
+      syncEventId: note.sync_event_id,
+      creditNoteId: String(note.credit_note_id),
+      receiptNumber: note.receipt_number || null,
+      originalSaleId: note.original_sale_id || null,
+      branchId: note.branch_id || 'Unassigned',
+      terminalId: note.terminal_id || 'Unassigned',
+      storeId: note.store_id,
+      creditNoteDate: note.credit_note_date,
+      batchReceivedAt: syncEvent.received_at,
+      subtotal: roundCurrency(note.subtotal),
+      taxAmount: roundCurrency(note.tax_amount),
+      amount: roundCurrency(note.total_amount),
+      paymentMethod: note.payment_method || null,
+      reason: note.reason || null,
+      customerName: note.customer_name || null,
+      batchStatus: syncEvent.status,
+      batchStatusBucket: toStatusBucket(syncEvent.status),
+      sageDocumentNumber: document?.sage_document_number || null,
+      sageReference: document?.sage_reference || null,
+      postedToSage: posted,
+      pendingReason: buildCreditNotePendingReason(syncEvent, posted),
+      batchProcessedAt: syncEvent.processed_at,
+      batchLastAttemptAt: syncEvent.last_attempt_at,
+      batchRetryCount: syncEvent.retry_count,
+      batchIdempotencyKey: syncEvent.idempotency_key,
+      batchLastError: syncEvent.last_error || null,
+    };
+  });
+  const options = await loadProjectionOptions(models.reconCreditNote, 'credit_note_date', dateRange);
 
   return res.json({
     success: true,
@@ -2105,16 +2420,22 @@ router.get('/credit-notes', reconAuth, async (req, res) => {
       endDate: dateRange.endDate,
       branchId: filters.branchId || null,
       terminalId: filters.terminalId || null,
-      branchOptions,
-      terminalOptions,
+      branchOptions: options.branchOptions,
+      terminalOptions: options.terminalOptions,
     },
-    pagination: paginated.pagination,
-    rows: paginated.rows,
+    pagination: {
+      page: pagination.page,
+      pageSize: pagination.pageSize,
+      total: pagination.total,
+      totalPages: pagination.totalPages,
+    },
+    rows,
   });
 });
 
 router.get('/batches', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
+  await assertProjectionReady(models);
   const page = parsePage(req.query.page);
   const pageSize = parseLimit(req.query.pageSize || req.query.limit || 20);
   const dateRange = buildDateRange(req.query);
@@ -2132,19 +2453,67 @@ router.get('/batches', reconAuth, async (req, res) => {
     eventType,
     filters,
   });
-
-  const events = await loadEventsWithExports(models, eventType, dateRange);
-  const branchOptions = collectOptions(events.map((event) => getBranchId(event)));
-  const terminalOptions = collectOptions(events.map((event) => getTerminalId(event)));
-  const rows = sortByIdDesc(events)
-    .filter((event) => eventMatchesFilters(event, filters))
-    .map(buildBatchRow);
-  const paginated = paginateRows(rows, page, pageSize);
-  console.log('[reconciliation] /batches prepared rows', {
-    totalRows: rows.length,
-    page,
-    pageSize,
+  const where = projectionWhere('received_at', dateRange, filters);
+  where.event_type = eventType;
+  const statusWhere = batchStatusWhere(filters.status);
+  const include = [{
+    model: models.syncEvent,
+    as: 'syncEvent',
+    attributes: PROJECTION_EVENT_ATTRIBUTES,
+    required: true,
+    ...(statusWhere ? { where: { status: statusWhere } } : {}),
+  }];
+  const total = await models.reconBatch.count({ where, include });
+  const pagination = databasePagination(total, page, pageSize);
+  const batchRecords = await models.reconBatch.findAll({
+    where,
+    include,
+    order: [['received_at', 'DESC'], ['sync_event_id', 'DESC']],
+    limit: pageSize,
+    offset: pagination.offset,
   });
+  const plainBatches = batchRecords.map((record) => record.toJSON());
+  const eventIds = plainBatches.map((row) => row.sync_event_id);
+  const exportRows = eventIds.length > 0
+    ? await models.syncSaleExport.findAll({
+        where: { sync_event_id: { [Op.in]: eventIds } },
+        raw: true,
+      })
+    : [];
+  const exportsByEvent = groupExportsByEventId(exportRows);
+  const rows = plainBatches.map((batch) => {
+    const syncEvent = projectionEvent(batch);
+    const eventExports = exportsByEvent.get(batch.sync_event_id) || [];
+    const references = Array.from(new Set(eventExports.map((row) => row.sage_reference).filter(Boolean)));
+    return {
+      id: batch.sync_event_id,
+      eventType: batch.event_type,
+      label: EVENT_TYPE_LABELS[batch.event_type] || batch.event_type,
+      status: syncEvent.status,
+      statusBucket: toStatusBucket(syncEvent.status),
+      storeId: batch.store_id,
+      branchId: batch.branch_id || 'Unassigned',
+      terminalId: batch.terminal_id || 'Unassigned',
+      transactionCount: batch.transaction_count,
+      totalAmount: roundCurrency(batch.total_amount),
+      creditNoteCount: batch.credit_note_count,
+      creditNoteTotal: roundCurrency(batch.credit_note_total),
+      exportedCount: eventExports.length,
+      receivedAt: batch.received_at,
+      processedAt: syncEvent.processed_at,
+      lastAttemptAt: syncEvent.last_attempt_at,
+      retryCount: syncEvent.retry_count,
+      idempotencyKey: syncEvent.idempotency_key,
+      sageReferences: references.slice(0, 3),
+      lastError: syncEvent.last_error,
+    };
+  });
+  const options = await loadProjectionOptions(
+    models.reconBatch,
+    'received_at',
+    dateRange,
+    { event_type: eventType }
+  );
 
   return res.json({
     success: true,
@@ -2156,12 +2525,17 @@ router.get('/batches', reconAuth, async (req, res) => {
       branchId: filters.branchId || null,
       terminalId: filters.terminalId || null,
       status: filters.status || null,
-      branchOptions,
-      terminalOptions,
+      branchOptions: options.branchOptions,
+      terminalOptions: options.terminalOptions,
       statusOptions: ['completed', 'pending', 'failed'],
     },
-    pagination: paginated.pagination,
-    rows: paginated.rows,
+    pagination: {
+      page: pagination.page,
+      pageSize: pagination.pageSize,
+      total: pagination.total,
+      totalPages: pagination.totalPages,
+    },
+    rows,
   });
 });
 

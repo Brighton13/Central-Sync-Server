@@ -82,6 +82,35 @@ class SyncSaleExportService {
     }]));
   }
 
+  async updateReconciliationProjection(documentType, records) {
+    const projectionModel = documentType === 'oe_order'
+      ? this.models.reconSale
+      : this.models.reconCreditNote;
+    if (!projectionModel || records.length === 0) return;
+
+    const groups = new Map();
+    for (const value of records) {
+      const record = value.toJSON ? value.toJSON() : value;
+      const groupKey = JSON.stringify([
+        record.sage_document_number,
+        record.sage_reference,
+        record.exported_at,
+      ]);
+      const group = groups.get(groupKey) || { record, identities: [] };
+      group.identities.push(this.buildIdentityKey(record.store_id, record.receipt_number, record.sale_id));
+      groups.set(groupKey, group);
+    }
+
+    await Promise.all(Array.from(groups.values()).map(({ record, identities }) => projectionModel.update({
+      posted_to_sage: true,
+      sage_document_number: record.sage_document_number,
+      sage_reference: record.sage_reference,
+      exported_at: record.exported_at,
+    }, {
+      where: { identity_key: { [Op.in]: identities } },
+    })));
+  }
+
   async persistExports(syncEvent, sales, dispatchResult, documentType) {
     if (!syncEvent || sales.length === 0 || !documentType) {
       return [];
@@ -128,6 +157,8 @@ class SyncSaleExportService {
 
       persisted.push(record);
     }
+
+    await this.updateReconciliationProjection(documentType, persisted);
 
     return persisted;
   }

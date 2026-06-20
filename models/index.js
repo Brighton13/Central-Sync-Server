@@ -7,6 +7,10 @@ const modelDefinitions = [
   require('./customerDirectory'),
   require('./reconAuditLog'),
   require('./reconUser'),
+  require('./reconBatch'),
+  require('./reconSale'),
+  require('./reconCreditNote'),
+  require('./reconProjectionState'),
   require('./syncEvent'),
   require('./syncSaleExport'),
 ];

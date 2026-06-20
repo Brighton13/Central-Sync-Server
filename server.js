@@ -6,6 +6,7 @@ const { createSageWorker } = require('./workers/sageWorker');
 const { sageDispatchQueue } = require('./queues/syncQueues');
 const { recoverIncompleteEvents } = require('./services/syncEventQueueService');
 const { ensureDefaultReconUsers } = require('./services/reconAuthService');
+const { backfillReconciliationProjection } = require('./services/reconciliationProjectionService');
 
 const PORT = Number(process.env.PORT || 4000);
 
@@ -120,6 +121,64 @@ async function ensureSyncSaleExportsSchema() {
   }
 }
 
+function normalizeTableNames(tables) {
+  return new Set(tables.map((tableName) => (
+    typeof tableName === 'object' ? Object.values(tableName)[0] : tableName
+  )));
+}
+
+async function ensureTableColumns(queryInterface, existingTables, tableName, columnPlan) {
+  if (!existingTables.has(tableName)) {
+    return;
+  }
+
+  const table = await queryInterface.describeTable(tableName);
+  for (const [columnName, definition] of Object.entries(columnPlan)) {
+    if (table[columnName]) {
+      continue;
+    }
+
+    await queryInterface.addColumn(tableName, columnName, definition);
+    console.log(`Created column ${tableName}.${columnName}`);
+  }
+}
+
+// Repair additive projection columns before sync attempts to create their indexes.
+// This also makes startup recover safely after a previously interrupted table creation.
+async function ensureReconciliationProjectionSchema() {
+  const queryInterface = models.sequelize.getQueryInterface();
+  const existingTables = normalizeTableNames(await queryInterface.showAllTables());
+  const postingColumns = {
+    posted_to_sage: {
+      type: models.Sequelize.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    sage_document_number: {
+      type: models.Sequelize.STRING(100),
+      allowNull: true,
+    },
+    sage_reference: {
+      type: models.Sequelize.STRING(255),
+      allowNull: true,
+    },
+    exported_at: {
+      type: models.Sequelize.DATE,
+      allowNull: true,
+    },
+  };
+
+  await ensureTableColumns(queryInterface, existingTables, 'recon_sales', postingColumns);
+  await ensureTableColumns(queryInterface, existingTables, 'recon_credit_notes', postingColumns);
+  await ensureTableColumns(queryInterface, existingTables, 'recon_projection_state', {
+    is_backfilled: {
+      type: models.Sequelize.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+  });
+}
+
 // Ensure indexes exist on frequently-sorted columns. Tables like `sync_events` and
 // `recon_audit_logs` carry large JSON/TEXT columns (payload, response_payload,
 // last_error, details). Without an index on the ORDER BY column, MySQL filesorts the
@@ -153,6 +212,7 @@ async function ensureReconIndexes() {
 async function start() {
   await models.sequelize.authenticate();
   await ensureSyncSaleExportsSchema();
+  await ensureReconciliationProjectionSchema();
   await models.sequelize.sync();
   await ensureReconIndexes();
   await ensureDefaultReconUsers(models);
@@ -179,6 +239,10 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`Central sync server running on port ${PORT}`);
   });
+
+  backfillReconciliationProjection(models)
+    .then((result) => console.log('[reconProjection] backfill complete', result))
+    .catch((error) => console.error('[reconProjection] backfill failed:', error));
 }
 
 async function shutdown(signal) {
