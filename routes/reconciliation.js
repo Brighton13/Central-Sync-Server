@@ -1047,21 +1047,25 @@ router.get('/summary', reconAuth, async (req, res) => {
     event_type: { [Op.in]: RELEVANT_EVENT_TYPES },
     received_at: projectionDateWhere(dateRange),
   };
-  const saleWhere = { sale_date: projectionDateWhere(dateRange) };
-  const creditWhere = { credit_note_date: projectionDateWhere(dateRange) };
+  const batchRecords = await models.reconBatch.findAll({
+    where: batchWhere,
+    include: [{
+      model: models.syncEvent,
+      as: 'syncEvent',
+      attributes: PROJECTION_EVENT_ATTRIBUTES,
+      required: true,
+    }],
+    order: [['received_at', 'DESC'], ['sync_event_id', 'DESC']],
+  });
+  const eventIds = batchRecords.map((record) => record.sync_event_id);
+  // The main dashboard describes what central sync RECEIVED in the selected window.
+  // Day-end payloads commonly arrive today for yesterday's business date, so filtering
+  // these rows by sale_date made the Today preset incorrectly show zero activity.
+  const saleWhere = { sync_event_id: { [Op.in]: eventIds } };
+  const creditWhere = { sync_event_id: { [Op.in]: eventIds } };
 
-  const [batchRecords, totalSalesCount, postedSalesCount, totalSalesValue, totalCreditNotesCount,
+  const [totalSalesCount, postedSalesCount, totalSalesValue, totalCreditNotesCount,
     totalCreditNotesValue, saleGroups, recentProjectionExports] = await Promise.all([
-    models.reconBatch.findAll({
-      where: batchWhere,
-      include: [{
-        model: models.syncEvent,
-        as: 'syncEvent',
-        attributes: PROJECTION_EVENT_ATTRIBUTES,
-        required: true,
-      }],
-      order: [['received_at', 'DESC'], ['sync_event_id', 'DESC']],
-    }),
     models.reconSale.count({ where: saleWhere }),
     models.reconSale.count({ where: { ...saleWhere, posted_to_sage: true } }),
     models.reconSale.sum('total_amount', { where: saleWhere }),
