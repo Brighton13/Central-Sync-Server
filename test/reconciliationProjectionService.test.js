@@ -19,7 +19,17 @@ test('buildProjectionRows normalizes a day-end payload without retaining batch-w
       terminal_id: 'T-3',
       sales_count: 2,
       sales: [
-        { id: 10, receipt_number: 'RCP7-10', total_amount: 120.5, payment_method: 'Cash' },
+        {
+          id: 10,
+          receipt_number: 'RCP7-10',
+          total_amount: 120.5,
+          payment_method: 'Cash',
+          sdcid: 'SDC-1',
+          receipt_no: '1001',
+          zra_status: 'sent',
+          receipt_printed: true,
+          qrcode_url: 'https://example.test/qr/1001',
+        },
         { id: 11, total_amount: 79.5, payment_method: 'Card' },
       ],
       credit_notes: [{ id: 3, receipt_number: 'CN7-3', total_amount: 20 }],
@@ -31,7 +41,14 @@ test('buildProjectionRows normalizes a day-end payload without retaining batch-w
   assert.equal(rows.batch.credit_note_count, 1);
   assert.equal(rows.sales.length, 2);
   assert.equal(rows.sales[0].identity_key, 'rcp:RCP7-10');
+  assert.equal(rows.sales[0].zra_sdc_id, 'SDC-1');
+  assert.equal(rows.sales[0].zra_receipt_number, '1001');
+  assert.equal(rows.sales[0].zra_status, 'sent');
+  assert.equal(rows.sales[0].receipt_printed, true);
+  assert.equal(rows.sales[0].has_sdc_data, true);
+  assert.equal(rows.sales[0].has_qr_artifact, true);
   assert.equal(rows.sales[1].identity_key, 'sid:7:11');
+  assert.equal(rows.sales[1].has_sdc_data, false);
   assert.equal(rows.creditNotes[0].identity_key, 'rcp:CN7-3');
   assert.equal(Object.hasOwn(rows.sales[0], 'raw_data'), false);
 });
@@ -83,5 +100,6 @@ test('materializeSyncEvent writes bounded bulk rows and advances a completed pro
   assert.equal(captured.sales[0].rows.length, 1);
   assert.equal(captured.notes[0].rows.length, 1);
   assert.ok(captured.sales[0].options.updateOnDuplicate.includes('updatedAt'));
+  assert.ok(captured.sales[0].options.updateOnDuplicate.includes('has_sdc_data'));
   assert.equal(captured.stateUpdates[0].values.last_event_id, 123);
 });

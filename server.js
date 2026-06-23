@@ -128,8 +128,10 @@ function normalizeTableNames(tables) {
 }
 
 async function ensureTableColumns(queryInterface, existingTables, tableName, columnPlan) {
+  let addedColumn = false;
+
   if (!existingTables.has(tableName)) {
-    return;
+    return addedColumn;
   }
 
   const table = await queryInterface.describeTable(tableName);
@@ -140,7 +142,10 @@ async function ensureTableColumns(queryInterface, existingTables, tableName, col
 
     await queryInterface.addColumn(tableName, columnName, definition);
     console.log(`Created column ${tableName}.${columnName}`);
+    addedColumn = true;
   }
+
+  return addedColumn;
 }
 
 // Repair additive projection columns before sync attempts to create their indexes.
@@ -167,8 +172,64 @@ async function ensureReconciliationProjectionSchema() {
       allowNull: true,
     },
   };
+  const zraProjectionColumns = {
+    zra_sdc_id: {
+      type: models.Sequelize.STRING(100),
+      allowNull: true,
+    },
+    zra_receipt_number: {
+      type: models.Sequelize.STRING(100),
+      allowNull: true,
+    },
+    zra_status: {
+      type: models.Sequelize.STRING(50),
+      allowNull: false,
+      defaultValue: 'pending',
+    },
+    zra_invoice_number: {
+      type: models.Sequelize.STRING(100),
+      allowNull: true,
+    },
+    zra_signature: {
+      type: models.Sequelize.STRING(255),
+      allowNull: true,
+    },
+    zra_internal_data: {
+      type: models.Sequelize.STRING(255),
+      allowNull: true,
+    },
+    zra_qr_url: {
+      type: models.Sequelize.TEXT,
+      allowNull: true,
+    },
+    zra_qr_file_path: {
+      type: models.Sequelize.STRING(500),
+      allowNull: true,
+    },
+    receipt_printed: {
+      type: models.Sequelize.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    has_sdc_data: {
+      type: models.Sequelize.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    has_qr_artifact: {
+      type: models.Sequelize.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+  };
 
   await ensureTableColumns(queryInterface, existingTables, 'recon_sales', postingColumns);
+  const addedZraProjectionColumns = await ensureTableColumns(
+    queryInterface,
+    existingTables,
+    'recon_sales',
+    zraProjectionColumns
+  );
   await ensureTableColumns(queryInterface, existingTables, 'recon_credit_notes', postingColumns);
   await ensureTableColumns(queryInterface, existingTables, 'recon_projection_state', {
     is_backfilled: {
@@ -177,6 +238,15 @@ async function ensureReconciliationProjectionSchema() {
       defaultValue: false,
     },
   });
+
+  if (addedZraProjectionColumns && existingTables.has('recon_projection_state')) {
+    await models.sequelize.query(`
+      UPDATE recon_projection_state
+      SET last_event_id = 0, is_backfilled = 0
+      WHERE projection_name = 'reconciliation-v1'
+    `);
+    console.log('Reset reconciliation projection backfill for ZRA compliance columns');
+  }
 }
 
 // Ensure indexes exist on frequently-sorted columns. Tables like `sync_events` and
@@ -192,6 +262,7 @@ async function ensureReconIndexes() {
     ['sync_events', ['status', 'received_at', 'id'], 'idx_sync_events_status_received_id'],
     ['sync_events', ['status'], 'idx_sync_events_status'],
     ['sync_sale_exports', ['document_type', 'exported_at', 'id'], 'idx_sync_sale_exports_type_exported_id'],
+    ['recon_sales', ['has_sdc_data', 'sale_date'], 'idx_recon_sales_sdc_date'],
     ['recon_audit_logs', ['occurred_at'], 'idx_recon_audit_logs_occurred_at'],
   ];
 

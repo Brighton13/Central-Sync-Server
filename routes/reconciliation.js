@@ -234,218 +234,6 @@ function serializeSyncEvent(syncEvent) {
   };
 }
 
-const ZRA_COMPLIANCE_LOOKUP_EVENT_TYPES = ['day_end.ready', 'sale.created', 'sale.updated'];
-
-function unwrapSaleZraSource(source) {
-  if (!source || typeof source !== 'object') {
-    return {};
-  }
-
-  const vsdc = source.vsdc && typeof source.vsdc === 'object' ? source.vsdc : {};
-  const zra = source.zra && typeof source.zra === 'object' ? source.zra : {};
-  const fiscal = source.fiscal && typeof source.fiscal === 'object' ? source.fiscal : {};
-
-  return {
-    ...source,
-    sdcid: source.sdcid || source.sdc_id || source.sdcId || vsdc.sdcId || vsdc.sdc_id || zra.sdcId || fiscal.sdcId || null,
-    receipt_no: source.receipt_no || source.receiptNo || source.rcptNo || vsdc.rcptNo || vsdc.receipt_no || zra.rcptNo || fiscal.rcptNo || null,
-    invoice_no: source.invoice_no || source.invoiceNo || zra.invoiceNo || fiscal.invoiceNo || null,
-    invnumber: source.invnumber || source.invNumber || source.cisInvcNo || zra.invnumber || fiscal.invnumber || null,
-    receiptsig: source.receiptsig || source.receipt_sig || source.receiptSign || vsdc.receiptSign || vsdc.receipt_sig || zra.rcptSign || null,
-    intrldata: source.intrldata || source.intrlData || vsdc.intrlData || zra.intrlData || null,
-    qrcode_url: source.qrcode_url || source.qrCodeUrl || vsdc.qrCodeUrl || zra.qrCodeUrl || null,
-    qrfilepath: source.qrfilepath || source.qrFilePath || vsdc.qrFilePath || null,
-    vsdcrcpdate: source.vsdcrcpdate || source.vsdcRcpDate || source.vsdc_rcp_date || vsdc.vsdcRcpDate || null,
-    zra_status: source.zra_status || source.zraStatus || zra.status || null,
-    receipt_printed: source.receipt_printed ?? source.receiptPrinted ?? null,
-  };
-}
-
-function normalizeSaleZraFields(source) {
-  if (!source || typeof source !== 'object') {
-    return {
-      sdcid: null,
-      receipt_no: null,
-      zra_status: 'pending',
-      invoice_no: null,
-      invnumber: null,
-      receiptsig: null,
-      intrldata: null,
-      qrcode_url: null,
-      qrfilepath: null,
-      receipt_printed: false,
-    };
-  }
-
-  const flat = unwrapSaleZraSource(source);
-
-  return {
-    sdcid: flat.sdcid || null,
-    receipt_no: flat.receipt_no || null,
-    zra_status: String(flat.zra_status || 'pending').toLowerCase(),
-    invoice_no: flat.invoice_no || null,
-    invnumber: flat.invnumber || null,
-    receiptsig: flat.receiptsig || null,
-    intrldata: flat.intrldata || null,
-    qrcode_url: flat.qrcode_url || null,
-    qrfilepath: flat.qrfilepath || null,
-    receipt_printed: Boolean(flat.receipt_printed ?? false),
-  };
-}
-
-function getFiscalInvoiceRef(zra) {
-  return zra.invoice_no || zra.invnumber || null;
-}
-
-function looksLikeFiscalInvoice(value) {
-  if (!value) {
-    return false;
-  }
-
-  const text = String(value).trim();
-  // ZRA fiscal refs are typically INV{device}/{seq}, CRN{device}/{seq}, or branch-style INV1304-133.
-  return /^(INV|CRN)[A-Za-z0-9]+(?:[/-]\d+|\d+-\d+)$/i.test(text);
-}
-
-function mergeSaleZraFields(target, patch) {
-  const base = normalizeSaleZraFields(target);
-  const extra = normalizeSaleZraFields(patch);
-
-  return {
-    ...target,
-    sdcid: base.sdcid || extra.sdcid,
-    receipt_no: base.receipt_no || extra.receipt_no,
-    zra_status: base.zra_status !== 'pending' ? base.zra_status : extra.zra_status,
-    invoice_no: base.invoice_no || extra.invoice_no,
-    invnumber: base.invnumber || extra.invnumber,
-    receiptsig: base.receiptsig || extra.receiptsig,
-    qrcode_url: base.qrcode_url || extra.qrcode_url,
-    qrfilepath: base.qrfilepath || extra.qrfilepath,
-    receipt_printed: base.receipt_printed || extra.receipt_printed,
-  };
-}
-
-function collectSaleZraSourcesFromPayload(payload, syncEvent) {
-  const sources = [];
-
-  if (Array.isArray(payload?.sales)) {
-    sources.push(...payload.sales);
-  }
-
-  if (payload?.sale && typeof payload.sale === 'object' && (payload.sale.id || payload.sale.receipt_number)) {
-    sources.push(payload.sale);
-  }
-
-  if (syncEvent?.event_type === 'sale.created' || syncEvent?.event_type === 'sale.updated') {
-    const sale = payload?.sale || payload;
-    if (sale && typeof sale === 'object') {
-      sources.push({
-        ...sale,
-        receipt_number: sale.receipt_number || syncEvent.receipt_number || null,
-      });
-    }
-  }
-
-  return sources;
-}
-
-// Indexes ZRA/SDC fields from day-end batch sales and per-sale sync events (sale.created).
-// Latest event wins per receipt so compliance can read SDC data wherever it was captured.
-function buildSaleZraLookup(events) {
-  const lookup = new Map();
-  const orderedEvents = [...events].sort((left, right) => left.id - right.id);
-
-  for (const syncEvent of orderedEvents) {
-    const payload = getPayload(syncEvent);
-
-    for (const sale of collectSaleZraSourcesFromPayload(payload, syncEvent)) {
-      if (!sale?.id && !sale?.receipt_number) {
-        continue;
-      }
-
-      const key = saleIdentityKey(syncEvent.store_id, sale.receipt_number, sale.id);
-      lookup.set(key, mergeSaleZraFields(lookup.get(key) || {}, sale));
-    }
-  }
-
-  return lookup;
-}
-
-function hasSaleSdcData(sale) {
-  const zra = normalizeSaleZraFields(sale);
-  const fiscalInvoiceRef = getFiscalInvoiceRef(zra);
-
-  if (zra.sdcid && zra.receipt_no) {
-    return true;
-  }
-
-  // ZRA fiscal invoice format (INVxxxx/nnn, CRNxxxx/nnn, or branch-style INV1304-133).
-  if (looksLikeFiscalInvoice(fiscalInvoiceRef)) {
-    return true;
-  }
-
-  if (zra.sdcid && fiscalInvoiceRef) {
-    return true;
-  }
-
-  if (zra.receipt_no && (zra.receiptsig || zra.intrldata || zra.qrcode_url || zra.qrfilepath)) {
-    return true;
-  }
-
-  if (zra.sdcid && (zra.receiptsig || zra.intrldata || zra.qrcode_url || zra.qrfilepath)) {
-    return true;
-  }
-
-  if (zra.zra_status === 'sent' && (zra.sdcid || zra.receipt_no || fiscalInvoiceRef || zra.receiptsig || zra.qrcode_url)) {
-    return true;
-  }
-
-  return false;
-}
-
-function getSaleZraStatus(sale) {
-  return normalizeSaleZraFields(sale).zra_status;
-}
-
-function isSaleReceiptPrinted(sale) {
-  return normalizeSaleZraFields(sale).receipt_printed;
-}
-
-function hasSaleQrArtifact(sale) {
-  const zra = normalizeSaleZraFields(sale);
-  return Boolean(zra.qrfilepath || zra.qrcode_url);
-}
-
-// Collects deduped sales from day-end batches (latest batch wins), matching /summary.
-// Each sale is enriched with the best-known ZRA/SDC snapshot from sync-event payloads.
-function collectDayEndSalesForCompliance(events) {
-  const zraLookup = buildSaleZraLookup(events);
-  const rowsByKey = new Map();
-  const orderedEvents = [...events].sort((left, right) => left.id - right.id);
-
-  for (const syncEvent of orderedEvents) {
-    if (syncEvent.event_type !== SALES_EVENT_TYPE) {
-      continue;
-    }
-
-    const branchId = String(getBranchId(syncEvent) || 'Unassigned');
-    const terminalId = String(getTerminalId(syncEvent) || 'Unassigned');
-
-    for (const rawSale of getSales(syncEvent)) {
-      const key = saleIdentityKey(syncEvent.store_id, rawSale.receipt_number, rawSale.id);
-      const sale = mergeSaleZraFields(rawSale, zraLookup.get(key) || {});
-      rowsByKey.set(key, {
-        sale,
-        branchId,
-        terminalId,
-        saleDate: sale.sale_date || sale.createdAt || getPayload(syncEvent).date || syncEvent.received_at,
-      });
-    }
-  }
-
-  return Array.from(rowsByKey.values());
-}
-
 function getSales(syncEvent) {
   const payload = getPayload(syncEvent);
   return Array.isArray(payload.sales) ? payload.sales : [];
@@ -1425,6 +1213,7 @@ router.get('/summary-legacy', reconAuth, async (req, res) => {
 
 router.get('/zra-compliance', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
+  await assertProjectionReady(models);
   const limit = parseLimit(req.query.limit);
   const dateRange = buildDateRange(req.query);
   console.log('[reconciliation] /zra-compliance request', {
@@ -1433,8 +1222,31 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
     limit,
   });
 
-  const events = await loadEventsWithExports(models, ZRA_COMPLIANCE_LOOKUP_EVENT_TYPES, dateRange);
-  const complianceSales = collectDayEndSalesForCompliance(events);
+  const batchRecords = await models.reconBatch.findAll({
+    where: {
+      event_type: SALES_EVENT_TYPE,
+      received_at: projectionDateWhere(dateRange),
+    },
+    attributes: ['sync_event_id'],
+    raw: true,
+  });
+  const eventIds = batchRecords.map((record) => record.sync_event_id);
+  const complianceSales = eventIds.length > 0
+    ? await models.reconSale.findAll({
+        where: { sync_event_id: { [Op.in]: eventIds } },
+        attributes: [
+          'id',
+          'branch_id',
+          'terminal_id',
+          'sale_date',
+          'zra_status',
+          'receipt_printed',
+          'has_sdc_data',
+          'has_qr_artifact',
+        ],
+        raw: true,
+      })
+    : [];
 
   const terminalCompliance = new Map();
   const branchCompliance = new Map();
@@ -1446,7 +1258,10 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
   let receiptPrintedCount = 0;
   let qrArtifactCount = 0;
 
-  for (const { sale, branchId, terminalId, saleDate } of complianceSales) {
+  for (const sale of complianceSales) {
+    const branchId = String(sale.branch_id || 'Unassigned');
+    const terminalId = String(sale.terminal_id || 'Unassigned');
+    const saleDate = sale.sale_date;
     const key = `${branchId}:${terminalId}`;
     const terminalBucket = upsertComplianceBucket(terminalCompliance, key, `Terminal ${terminalId}`);
     const branchBucket = upsertComplianceBucket(branchCompliance, branchId, `Branch ${branchId}`);
@@ -1459,10 +1274,10 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
     terminalBucket.totalSalesCount += 1;
     branchBucket.totalSalesCount += 1;
 
-    const hasSdc = hasSaleSdcData(sale);
-    const zraStatus = getSaleZraStatus(sale);
-    const printed = isSaleReceiptPrinted(sale);
-    const hasQr = hasSaleQrArtifact(sale);
+    const hasSdc = Boolean(sale.has_sdc_data);
+    const zraStatus = String(sale.zra_status || 'pending').toLowerCase();
+    const printed = Boolean(sale.receipt_printed);
+    const hasQr = Boolean(sale.has_qr_artifact);
 
     if (hasSdc) {
       submittedCount += 1;
@@ -1511,7 +1326,7 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
     missingSdcCount,
     pendingCount,
     failedCount,
-    source: SALES_EVENT_TYPE,
+    source: 'recon_sales',
   });
 
   const terminalRows = Array.from(terminalCompliance.values())
@@ -1565,7 +1380,7 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
       complianceRate: calculateComplianceRate(submittedCount, totalSalesCount),
       printedRate: calculateComplianceRate(receiptPrintedCount, totalSalesCount),
       qrRate: calculateComplianceRate(qrArtifactCount, totalSalesCount),
-      source: 'day_end.ready',
+      source: 'recon_sales',
     },
     branchCompliance: branchRows,
     terminalCompliance: terminalRows,

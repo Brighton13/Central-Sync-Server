@@ -31,6 +31,69 @@ function cashierName(record) {
   return record?.cashier?.full_name || record?.cashier?.name || null;
 }
 
+function unwrapSaleZraSource(source) {
+  if (!source || typeof source !== 'object') {
+    return {};
+  }
+
+  const vsdc = source.vsdc && typeof source.vsdc === 'object' ? source.vsdc : {};
+  const zra = source.zra && typeof source.zra === 'object' ? source.zra : {};
+  const fiscal = source.fiscal && typeof source.fiscal === 'object' ? source.fiscal : {};
+
+  return {
+    ...source,
+    sdcid: source.sdcid || source.sdc_id || source.sdcId || vsdc.sdcId || vsdc.sdc_id || zra.sdcId || fiscal.sdcId || null,
+    receipt_no: source.receipt_no || source.receiptNo || source.rcptNo || vsdc.rcptNo || vsdc.receipt_no || zra.rcptNo || fiscal.rcptNo || null,
+    invoice_no: source.invoice_no || source.invoiceNo || zra.invoiceNo || fiscal.invoiceNo || null,
+    invnumber: source.invnumber || source.invNumber || source.cisInvcNo || zra.invnumber || fiscal.invnumber || null,
+    receiptsig: source.receiptsig || source.receipt_sig || source.receiptSign || vsdc.receiptSign || vsdc.receipt_sig || zra.rcptSign || null,
+    intrldata: source.intrldata || source.intrlData || vsdc.intrlData || zra.intrlData || null,
+    qrcode_url: source.qrcode_url || source.qrCodeUrl || vsdc.qrCodeUrl || zra.qrCodeUrl || null,
+    qrfilepath: source.qrfilepath || source.qrFilePath || vsdc.qrFilePath || null,
+    zra_status: source.zra_status || source.zraStatus || zra.status || null,
+    receipt_printed: source.receipt_printed ?? source.receiptPrinted ?? null,
+  };
+}
+
+function normalizeSaleZraFields(source) {
+  const flat = unwrapSaleZraSource(source);
+
+  return {
+    sdcid: flat.sdcid || null,
+    receipt_no: flat.receipt_no || null,
+    zra_status: String(flat.zra_status || 'pending').toLowerCase(),
+    invoice_no: flat.invoice_no || null,
+    invnumber: flat.invnumber || null,
+    receiptsig: flat.receiptsig || null,
+    intrldata: flat.intrldata || null,
+    qrcode_url: flat.qrcode_url || null,
+    qrfilepath: flat.qrfilepath || null,
+    receipt_printed: Boolean(flat.receipt_printed ?? false),
+  };
+}
+
+function looksLikeFiscalInvoice(value) {
+  if (!value) {
+    return false;
+  }
+
+  return /^(INV|CRN)[A-Za-z0-9]+(?:[/-]\d+|\d+-\d+)$/i.test(String(value).trim());
+}
+
+function hasSaleSdcData(source) {
+  const zra = normalizeSaleZraFields(source);
+  const fiscalInvoiceRef = zra.invoice_no || zra.invnumber || null;
+
+  if (zra.sdcid && zra.receipt_no) return true;
+  if (looksLikeFiscalInvoice(fiscalInvoiceRef)) return true;
+  if (zra.sdcid && fiscalInvoiceRef) return true;
+  if (zra.receipt_no && (zra.receiptsig || zra.intrldata || zra.qrcode_url || zra.qrfilepath)) return true;
+  if (zra.sdcid && (zra.receiptsig || zra.intrldata || zra.qrcode_url || zra.qrfilepath)) return true;
+  if (zra.zra_status === 'sent' && (zra.sdcid || zra.receipt_no || fiscalInvoiceRef || zra.receiptsig || zra.qrcode_url)) return true;
+
+  return false;
+}
+
 function extractCreditNotes(event, payload) {
   if (Array.isArray(payload.credit_notes)) return payload.credit_notes;
   if (Array.isArray(payload.creditNotes)) return payload.creditNotes;
@@ -51,24 +114,40 @@ function buildProjectionRows(syncEvent) {
   const terminalId = terminalValue == null ? null : String(terminalValue);
   const receivedAt = validDate(event.received_at, new Date());
 
-  const saleRows = sales.filter((sale) => sale?.id != null).map((sale) => ({
-    identity_key: identityKey(event.store_id, sale.receipt_number, sale.id),
-    sync_event_id: event.id,
-    sale_id: String(sale.id),
-    receipt_number: sale.receipt_number || null,
-    store_id: event.store_id,
-    branch_id: branchId,
-    terminal_id: terminalId,
-    sale_date: validDate(sale.sale_date || sale.date || payload.date, receivedAt),
-    subtotal: numberValue(sale.subtotal),
-    discount_amount: numberValue(sale.discount_amount),
-    tax_amount: numberValue(sale.tax_amount),
-    total_amount: numberValue(sale.total_amount),
-    payment_method: sale.payment_method || null,
-    invoice_number: sale.invoice_no || sale.invnumber || null,
-    customer_name: customerName(sale),
-    cashier_name: cashierName(sale),
-  }));
+  const saleRows = sales.filter((sale) => sale?.id != null).map((sale) => {
+    const zra = normalizeSaleZraFields(sale);
+    const zraInvoiceNumber = zra.invoice_no || zra.invnumber || null;
+
+    return {
+      identity_key: identityKey(event.store_id, sale.receipt_number, sale.id),
+      sync_event_id: event.id,
+      sale_id: String(sale.id),
+      receipt_number: sale.receipt_number || null,
+      store_id: event.store_id,
+      branch_id: branchId,
+      terminal_id: terminalId,
+      sale_date: validDate(sale.sale_date || sale.date || payload.date, receivedAt),
+      subtotal: numberValue(sale.subtotal),
+      discount_amount: numberValue(sale.discount_amount),
+      tax_amount: numberValue(sale.tax_amount),
+      total_amount: numberValue(sale.total_amount),
+      payment_method: sale.payment_method || null,
+      invoice_number: sale.invoice_no || sale.invnumber || null,
+      zra_sdc_id: zra.sdcid,
+      zra_receipt_number: zra.receipt_no,
+      zra_status: zra.zra_status,
+      zra_invoice_number: zraInvoiceNumber,
+      zra_signature: zra.receiptsig,
+      zra_internal_data: zra.intrldata,
+      zra_qr_url: zra.qrcode_url,
+      zra_qr_file_path: zra.qrfilepath,
+      receipt_printed: zra.receipt_printed,
+      has_sdc_data: hasSaleSdcData(sale),
+      has_qr_artifact: Boolean(zra.qrfilepath || zra.qrcode_url),
+      customer_name: customerName(sale),
+      cashier_name: cashierName(sale),
+    };
+  });
 
   const creditNoteRows = creditNotes.filter((note) => note?.id != null).map((note) => ({
     identity_key: identityKey(event.store_id, note.receipt_number, note.id),
@@ -160,7 +239,10 @@ async function materializeSyncEvent(models, syncEvent, options = {}) {
       updateOnDuplicate: [
         'sync_event_id', 'sale_id', 'receipt_number', 'store_id', 'branch_id', 'terminal_id',
         'sale_date', 'subtotal', 'discount_amount', 'tax_amount', 'total_amount',
-        'payment_method', 'invoice_number', 'customer_name', 'cashier_name', 'posted_to_sage',
+        'payment_method', 'invoice_number', 'zra_sdc_id', 'zra_receipt_number',
+        'zra_status', 'zra_invoice_number', 'zra_signature', 'zra_internal_data',
+        'zra_qr_url', 'zra_qr_file_path', 'receipt_printed', 'has_sdc_data',
+        'has_qr_artifact', 'customer_name', 'cashier_name', 'posted_to_sage',
         'sage_document_number', 'sage_reference', 'exported_at', 'updatedAt',
       ],
     });
