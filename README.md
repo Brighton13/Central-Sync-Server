@@ -45,16 +45,18 @@ Collects sync events from multiple POS backends, persists them with idempotency 
 
 - Incomplete events are recovered with keyset pagination in batches controlled by
   `SYNC_RECOVERY_BATCH_SIZE` (default `250`).
-- Reconciliation requests are rejected with HTTP `413` before loading data when their
-  raw event payload exceeds `RECON_MAX_PAYLOAD_BYTES` (default `64 MiB`). Use a shorter
-  date range when this occurs.
+- Legacy raw-payload reconciliation is rejected with HTTP `413` before loading data when
+  its event JSON exceeds `RECON_MAX_PAYLOAD_BYTES` (default `64 MiB`). Dashboard pages
+  and Excel exports use normalized projections and are not constrained by raw JSON size.
+- Excel exports scan normalized rows with keyset pagination controlled by
+  `RECON_EXPORT_BATCH_SIZE` (default `1000`, bounded from `100` to `5000`).
 - Database pool sizing is controlled by `DB_POOL_MAX`, `DB_POOL_MIN`,
   `DB_POOL_ACQUIRE_MS`, and `DB_POOL_IDLE_MS`.
 - Required reconciliation range indexes are installed idempotently during startup.
 
 ### Normalized reconciliation projection
 
-Dashboard summaries and the sales, credit-note, and batch registers read from compact
+Dashboard summaries, Excel exports, and the sales, credit-note, and batch registers read from compact
 `recon_batches`, `recon_sales`, and `recon_credit_notes` tables. New sync events update
 these tables in the same transaction as ingestion. On the first upgraded startup, an
 idempotent background backfill processes historical event JSON in batches controlled by

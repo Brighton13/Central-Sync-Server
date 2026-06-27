@@ -5,6 +5,11 @@ const ExcelJS = require('exceljs');
 const { reconAuth, requireReconRole } = require('../middleware/reconAuth');
 const { queueSyncEvent } = require('../services/syncEventQueueService');
 const EventDispatchService = require('../services/eventDispatchService');
+const {
+  loadProjectionRowsInBatches,
+  salesProjectionToExportRow,
+  creditNoteProjectionToExportRow,
+} = require('../services/reconciliationExportService');
 
 const router = express.Router();
 
@@ -1657,18 +1662,23 @@ router.get('/sales/export', reconAuth, async (req, res) => {
   console.log('[reconciliation] /sales/export request', { query: req.query, dateRange, filters });
 
   try {
-    const events = await loadEventsWithExports(models, SALES_EVENT_TYPE, dateRange);
-    const exportLookup = await loadExportsForSales(models, events);
-    const rows = collectSalesExportRows(events, exportLookup, filters, dateRange);
+    await assertProjectionReady(models);
+    const projectionRows = await loadProjectionRowsInBatches(
+      models.reconSale,
+      'sale_date',
+      dateRange,
+      filters
+    );
+    const rows = projectionRows.map(salesProjectionToExportRow);
 
     // Group rows by branch for the per-branch sheets, sorted newest sale first.
     const rowsByBranch = new Map();
     for (const row of rows) {
-      const terminalId = String(row.terminalId || 'Unassigned');
-      if (!rowsByBranch.has(terminalId)) {
-        rowsByBranch.set(terminalId, []);
+      const branchId = String(row.branchId || 'Unassigned');
+      if (!rowsByBranch.has(branchId)) {
+        rowsByBranch.set(branchId, []);
       }
-      rowsByBranch.get(terminalId).push(row);
+      rowsByBranch.get(branchId).push(row);
     }
     for (const branchRows of rowsByBranch.values()) {
       branchRows.sort((left, right) => new Date(right.saleDate) - new Date(left.saleDate));
@@ -1682,11 +1692,11 @@ router.get('/sales/export', reconAuth, async (req, res) => {
 
     const sortedBranches = Array.from(rowsByBranch.entries()).sort((left, right) => left[0].localeCompare(right[0]));
     const usedSheetNames = new Set(['Summary by Branch']);
-    for (const [TerminalId, branchRows] of sortedBranches) {
-      let sheetName = sanitizeSheetName(`${TerminalId}`, 'Branch');
+    for (const [branchId, branchRows] of sortedBranches) {
+      let sheetName = sanitizeSheetName(`Branch ${branchId}`, 'Branch');
       let suffix = 2;
       while (usedSheetNames.has(sheetName)) {
-        sheetName = sanitizeSheetName(`${TerminalId} (${suffix})`, 'Branch');
+        sheetName = sanitizeSheetName(`Branch ${branchId} (${suffix})`, 'Branch');
         suffix += 1;
       }
       usedSheetNames.add(sheetName);
@@ -1937,9 +1947,14 @@ router.get('/credit-notes/export', reconAuth, async (req, res) => {
   console.log('[reconciliation] /credit-notes/export request', { query: req.query, dateRange, filters });
 
   try {
-    const events = await loadEventsWithExports(models, CREDIT_NOTE_BATCH_EVENT_TYPE, dateRange);
-    const exportLookup = await loadCreditNoteExports(models, events);
-    const rows = collectCreditNotesExportRows(events, exportLookup, filters, dateRange);
+    await assertProjectionReady(models);
+    const projectionRows = await loadProjectionRowsInBatches(
+      models.reconCreditNote,
+      'credit_note_date',
+      dateRange,
+      filters
+    );
+    const rows = projectionRows.map(creditNoteProjectionToExportRow);
 
     const rowsByBranch = new Map();
     for (const row of rows) {
