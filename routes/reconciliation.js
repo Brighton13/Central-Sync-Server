@@ -1025,6 +1025,75 @@ router.get('/summary', reconAuth, async (req, res) => {
   });
 });
 
+// Daily operational register used by the reconciliation dashboard. A terminal is
+// considered synced as soon as Central Sync receives at least one projected batch
+// from it during the server's current calendar day.
+router.get('/terminal-sync-status', reconAuth, async (req, res) => {
+  const models = req.app.locals.models;
+  await assertProjectionReady(models);
+
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const todayEnd = new Date(todayStart);
+  todayEnd.setDate(todayEnd.getDate() + 1);
+
+  const terminalGroups = await models.reconBatch.findAll({
+    attributes: [
+      'branch_id',
+      'terminal_id',
+      [fn('MAX', col('received_at')), 'last_received_at'],
+      [fn('COUNT', col('sync_event_id')), 'batch_count'],
+    ],
+    where: {
+      terminal_id: { [Op.ne]: null },
+    },
+    group: ['branch_id', 'terminal_id'],
+    raw: true,
+  });
+
+  const terminals = terminalGroups
+    .map((row) => {
+      const lastReceivedAt = row.last_received_at ? new Date(row.last_received_at) : null;
+      const sentToday = Boolean(
+        lastReceivedAt
+        && lastReceivedAt >= todayStart
+        && lastReceivedAt < todayEnd
+      );
+      const terminalId = String(row.terminal_id);
+
+      return {
+        key: `${row.branch_id || 'Unassigned'}:${terminalId}`,
+        terminalId,
+        terminalName: `Terminal ${terminalId}`,
+        branchId: String(row.branch_id || 'Unassigned'),
+        sentToday,
+        lastReceivedAt: lastReceivedAt ? lastReceivedAt.toISOString() : null,
+        batchCount: Number(row.batch_count || 0),
+      };
+    })
+    .sort((left, right) => {
+      if (left.sentToday !== right.sentToday) return left.sentToday ? 1 : -1;
+      return left.terminalName.localeCompare(right.terminalName, undefined, { numeric: true });
+    });
+
+  const syncedCount = terminals.filter((terminal) => terminal.sentToday).length;
+
+  return res.json({
+    success: true,
+    generatedAt: new Date().toISOString(),
+    day: {
+      start: todayStart.toISOString(),
+      end: todayEnd.toISOString(),
+    },
+    summary: {
+      totalTerminals: terminals.length,
+      syncedCount,
+      missingCount: terminals.length - syncedCount,
+    },
+    terminals,
+  });
+});
+
 router.get('/summary-legacy', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
   const limit = parseLimit(req.query.limit);
