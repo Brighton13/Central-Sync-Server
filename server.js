@@ -231,6 +231,12 @@ async function ensureReconciliationProjectionSchema() {
     zraProjectionColumns
   );
   await ensureTableColumns(queryInterface, existingTables, 'recon_credit_notes', postingColumns);
+  const addedBatchDate = await ensureTableColumns(queryInterface, existingTables, 'recon_batches', {
+    batch_date: {
+      type: models.Sequelize.DATE,
+      allowNull: true,
+    },
+  });
   await ensureTableColumns(queryInterface, existingTables, 'recon_projection_state', {
     is_backfilled: {
       type: models.Sequelize.BOOLEAN,
@@ -239,13 +245,13 @@ async function ensureReconciliationProjectionSchema() {
     },
   });
 
-  if (addedZraProjectionColumns && existingTables.has('recon_projection_state')) {
+  if ((addedZraProjectionColumns || addedBatchDate) && existingTables.has('recon_projection_state')) {
     await models.sequelize.query(`
       UPDATE recon_projection_state
       SET last_event_id = 0, is_backfilled = 0
       WHERE projection_name = 'reconciliation-v1'
     `);
-    console.log('Reset reconciliation projection backfill for ZRA compliance columns');
+    console.log('Reset reconciliation projection backfill for newly added reporting columns');
   }
 }
 
@@ -263,6 +269,7 @@ async function ensureReconIndexes() {
     ['sync_events', ['status'], 'idx_sync_events_status'],
     ['sync_sale_exports', ['document_type', 'exported_at', 'id'], 'idx_sync_sale_exports_type_exported_id'],
     ['recon_sales', ['has_sdc_data', 'sale_date'], 'idx_recon_sales_sdc_date'],
+    ['recon_batches', ['event_type', 'batch_date', 'sync_event_id'], 'idx_recon_batches_type_date_event'],
     ['recon_audit_logs', ['occurred_at'], 'idx_recon_audit_logs_occurred_at'],
   ];
 

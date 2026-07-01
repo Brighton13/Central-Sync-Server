@@ -39,6 +39,7 @@ test('buildProjectionRows normalizes a day-end payload without retaining batch-w
   assert.equal(rows.batch.transaction_count, 2);
   assert.equal(rows.batch.total_amount, 200);
   assert.equal(rows.batch.credit_note_count, 1);
+  assert.equal(rows.batch.batch_date.toISOString(), '2026-06-20T00:00:00.000Z');
   assert.equal(rows.sales.length, 2);
   assert.equal(rows.sales[0].identity_key, 'rcp:RCP7-10');
   assert.equal(rows.sales[0].zra_sdc_id, 'SDC-1');
@@ -70,6 +71,31 @@ test('buildProjectionRows supports legacy single credit-note events', () => {
   assert.equal(Object.hasOwn(rows.creditNotes[0], 'raw_data'), false);
   assert.equal(rows.batch.total_amount, 50);
   assert.equal(identityKey(2, null, 8), 'sid:2:8');
+});
+
+test('buildProjectionRows projects standalone per-sale check-ins', () => {
+  const rows = buildProjectionRows({
+    id: 101,
+    event_type: 'sale.created',
+    store_id: 3,
+    received_at: '2026-06-28T08:30:00.000Z',
+    payload: {
+      branch_id: '001',
+      terminal_id: 'T-02',
+      sale: {
+        id: 88,
+        receipt_number: 'RCP1001-88',
+        total_amount: 116,
+        tax_amount: 16,
+        zra_status: 'pending',
+      },
+    },
+  });
+
+  assert.equal(rows.batch.transaction_count, 1);
+  assert.equal(rows.batch.terminal_id, 'T-02');
+  assert.equal(rows.sales.length, 1);
+  assert.equal(rows.sales[0].identity_key, 'rcp:RCP1001-88');
 });
 
 test('materializeSyncEvent writes bounded bulk rows and advances a completed projection', async () => {

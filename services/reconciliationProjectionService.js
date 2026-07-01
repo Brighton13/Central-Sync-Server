@@ -1,7 +1,7 @@
 const { Op } = require('sequelize');
 
 const PROJECTION_NAME = 'reconciliation-v1';
-const PROJECTED_EVENT_TYPES = ['day_end.ready', 'credit_note.created', 'credit_note_batch.ready'];
+const PROJECTED_EVENT_TYPES = ['day_end.ready', 'sale.created', 'credit_note.created', 'credit_note_batch.ready'];
 
 function toPlain(value) {
   return value?.toJSON ? value.toJSON() : value;
@@ -107,12 +107,22 @@ function extractCreditNotes(event, payload) {
 function buildProjectionRows(syncEvent) {
   const event = toPlain(syncEvent);
   const payload = event.payload || {};
-  const sales = Array.isArray(payload.sales) ? payload.sales : [];
+  const sales = Array.isArray(payload.sales)
+    ? payload.sales
+    : (event.event_type === 'sale.created' && payload.sale ? [payload.sale] : []);
   const creditNotes = extractCreditNotes(event, payload);
   const branchId = payload.branch_id == null ? null : String(payload.branch_id);
   const terminalValue = payload.terminal_id ?? payload.branch_id;
   const terminalId = terminalValue == null ? null : String(terminalValue);
   const receivedAt = validDate(event.received_at, new Date());
+  const firstTransactionDate = sales[0]?.sale_date
+    || sales[0]?.date
+    || creditNotes[0]?.credit_note_date
+    || creditNotes[0]?.date;
+  const batchDate = validDate(
+    payload.date || payload.business_date || payload.day_end_date || firstTransactionDate,
+    receivedAt
+  );
 
   const saleRows = sales.filter((sale) => sale?.id != null).map((sale) => {
     const zra = normalizeSaleZraFields(sale);
@@ -184,6 +194,7 @@ function buildProjectionRows(syncEvent) {
       total_amount: sales.length > 0 ? salesTotal : creditNoteTotal,
       credit_note_count: creditNotes.length,
       credit_note_total: creditNoteTotal,
+      batch_date: batchDate,
       received_at: receivedAt,
     },
     sales: saleRows,

@@ -836,9 +836,29 @@ router.get('/summary', reconAuth, async (req, res) => {
   await assertProjectionReady(models);
   const limit = parseLimit(req.query.limit);
   const dateRange = buildDateRange(req.query);
+  const saleWhere = { sale_date: projectionDateWhere(dateRange) };
+  const creditWhere = { credit_note_date: projectionDateWhere(dateRange) };
+  const [saleEventRows, creditEventRows] = await Promise.all([
+    models.reconSale.findAll({
+      attributes: ['sync_event_id'],
+      where: saleWhere,
+      group: ['sync_event_id'],
+      raw: true,
+    }),
+    models.reconCreditNote.findAll({
+      attributes: ['sync_event_id'],
+      where: creditWhere,
+      group: ['sync_event_id'],
+      raw: true,
+    }),
+  ]);
+  const eventIds = Array.from(new Set([
+    ...saleEventRows.map((row) => row.sync_event_id),
+    ...creditEventRows.map((row) => row.sync_event_id),
+  ]));
   const batchWhere = {
     event_type: { [Op.in]: RELEVANT_EVENT_TYPES },
-    received_at: projectionDateWhere(dateRange),
+    sync_event_id: { [Op.in]: eventIds },
   };
   const batchRecords = await models.reconBatch.findAll({
     where: batchWhere,
@@ -850,13 +870,6 @@ router.get('/summary', reconAuth, async (req, res) => {
     }],
     order: [['received_at', 'DESC'], ['sync_event_id', 'DESC']],
   });
-  const eventIds = batchRecords.map((record) => record.sync_event_id);
-  // The main dashboard describes what central sync RECEIVED in the selected window.
-  // Day-end payloads commonly arrive today for yesterday's business date, so filtering
-  // these rows by sale_date made the Today preset incorrectly show zero activity.
-  const saleWhere = { sync_event_id: { [Op.in]: eventIds } };
-  const creditWhere = { sync_event_id: { [Op.in]: eventIds } };
-
   const [totalSalesCount, postedSalesCount, totalSalesValue, totalCreditNotesCount,
     totalCreditNotesValue, saleGroups, recentProjectionExports] = await Promise.all([
     models.reconSale.count({ where: saleWhere }),
@@ -879,9 +892,9 @@ router.get('/summary', reconAuth, async (req, res) => {
     models.reconSale.findAll({
       where: {
         posted_to_sage: true,
-        exported_at: projectionDateWhere(dateRange),
+        sale_date: projectionDateWhere(dateRange),
       },
-      order: [['exported_at', 'DESC'], ['id', 'DESC']],
+      order: [['sale_date', 'DESC'], ['id', 'DESC']],
       limit: limit * 2,
       raw: true,
     }),
@@ -1296,31 +1309,20 @@ router.get('/zra-compliance', reconAuth, async (req, res) => {
     limit,
   });
 
-  const batchRecords = await models.reconBatch.findAll({
-    where: {
-      event_type: SALES_EVENT_TYPE,
-      received_at: projectionDateWhere(dateRange),
-    },
-    attributes: ['sync_event_id'],
+  const complianceSales = await models.reconSale.findAll({
+    where: { sale_date: projectionDateWhere(dateRange) },
+    attributes: [
+      'id',
+      'branch_id',
+      'terminal_id',
+      'sale_date',
+      'zra_status',
+      'receipt_printed',
+      'has_sdc_data',
+      'has_qr_artifact',
+    ],
     raw: true,
   });
-  const eventIds = batchRecords.map((record) => record.sync_event_id);
-  const complianceSales = eventIds.length > 0
-    ? await models.reconSale.findAll({
-        where: { sync_event_id: { [Op.in]: eventIds } },
-        attributes: [
-          'id',
-          'branch_id',
-          'terminal_id',
-          'sale_date',
-          'zra_status',
-          'receipt_printed',
-          'has_sdc_data',
-          'has_qr_artifact',
-        ],
-        raw: true,
-      })
-    : [];
 
   const terminalCompliance = new Map();
   const branchCompliance = new Map();
@@ -2356,7 +2358,7 @@ router.get('/batches', reconAuth, async (req, res) => {
     eventType,
     filters,
   });
-  const where = projectionWhere('received_at', dateRange, filters);
+  const where = projectionWhere('batch_date', dateRange, filters);
   where.event_type = eventType;
   const statusWhere = batchStatusWhere(filters.status);
   const include = [{
@@ -2371,7 +2373,7 @@ router.get('/batches', reconAuth, async (req, res) => {
   const batchRecords = await models.reconBatch.findAll({
     where,
     include,
-    order: [['received_at', 'DESC'], ['sync_event_id', 'DESC']],
+    order: [['batch_date', 'DESC'], ['sync_event_id', 'DESC']],
     limit: pageSize,
     offset: pagination.offset,
   });
@@ -2402,6 +2404,7 @@ router.get('/batches', reconAuth, async (req, res) => {
       creditNoteCount: batch.credit_note_count,
       creditNoteTotal: roundCurrency(batch.credit_note_total),
       exportedCount: eventExports.length,
+      batchDate: batch.batch_date,
       receivedAt: batch.received_at,
       processedAt: syncEvent.processed_at,
       lastAttemptAt: syncEvent.last_attempt_at,
@@ -2413,7 +2416,7 @@ router.get('/batches', reconAuth, async (req, res) => {
   });
   const options = await loadProjectionOptions(
     models.reconBatch,
-    'received_at',
+    'batch_date',
     dateRange,
     { event_type: eventType }
   );

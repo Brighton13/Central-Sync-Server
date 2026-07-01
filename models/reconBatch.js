@@ -15,6 +15,7 @@ module.exports = (sequelize, DataTypes) => {
     total_amount: { type: DataTypes.DECIMAL(18, 2), allowNull: false, defaultValue: 0 },
     credit_note_count: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
     credit_note_total: { type: DataTypes.DECIMAL(18, 2), allowNull: false, defaultValue: 0 },
+    batch_date: { type: DataTypes.DATE, allowNull: false },
     received_at: { type: DataTypes.DATE, allowNull: false },
   }, {
     tableName: 'recon_batches',
@@ -22,6 +23,7 @@ module.exports = (sequelize, DataTypes) => {
     underscored: true,
     indexes: [
       { name: 'idx_recon_batches_type_received_event', fields: ['event_type', 'received_at', 'sync_event_id'] },
+      { name: 'idx_recon_batches_type_date_event', fields: ['event_type', 'batch_date', 'sync_event_id'] },
       { name: 'idx_recon_batches_branch_received', fields: ['branch_id', 'received_at'] },
       { name: 'idx_recon_batches_terminal_received', fields: ['terminal_id', 'received_at'] },
     ],
