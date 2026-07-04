@@ -9,6 +9,21 @@ class SageOrdersService {
     return [branchId || '000', terminalId || '000', orderDate].join(' ');
   }
 
+  buildDayEndOrderNumber(branchId, date) {
+    const normalizedBranchId = String(branchId || '').trim().replace(/[^A-Za-z0-9]/g, '');
+    const datePart = String(date || '').trim().slice(0, 10).replace(/-/g, '');
+
+    if (!normalizedBranchId) {
+      throw new Error('A branch ID is required to build the Sage day-end order number');
+    }
+
+    if (!/^\d{8}$/.test(datePart)) {
+      throw new Error('A valid day-end date is required to build the Sage order number');
+    }
+
+    return `${normalizedBranchId}-${datePart}`;
+  }
+
   getAuthConfig() {
     const baseUrl = process.env.SAGE_BASE_URL;
     const username = process.env.SAGE_USERNAME || 'API01';
@@ -56,6 +71,7 @@ class SageOrdersService {
 
   buildConsolidatedOrder(salesDataArray, user, date, terminalId, orderReference, options = {}) {
     const orderDate = date ? new Date(date).toISOString() : new Date().toISOString();
+    const orderNumber = this.buildDayEndOrderNumber(options.branchId, date);
     let detailIndex = 0;
     const orderDetails = [];
 
@@ -72,6 +88,7 @@ class SageOrdersService {
           Location: user?.store?.store_number || '',
           StockItem: true,
           QuantityOrdered: item.quantity,
+          QuantityShipped: item.quantity,
           OrderUnitOfMeasure: 'EACH',
           OrderUnitConversion: 1,
           OrderUnitPrice: item.unitPrice,
@@ -95,7 +112,7 @@ class SageOrdersService {
 
     return {
       OrderUniquifier: 0,
-      OrderNumber: '*** NEW ***',
+      OrderNumber: orderNumber,
       OrderReference: orderReference || '',
       CustomerNumber: user?.store?.store_customer_number || salesDataArray[0]?.salesData?.customer?.customer_number || '1101',
       CustomerGroupCode: user?.store?.currency || 'ZMW',
@@ -125,7 +142,9 @@ class SageOrdersService {
       TaxAuthority1: user?.store?.store_tax_group || 'VATZMW',
       TaxClass1: 1,
       OrderCompleted: 'IncompleteNotIncluded',
-      PostInvoice: false,
+      // Shipping every detail and enabling PostInvoice makes Sage post the shipment and
+      // create the corresponding O/E invoice as part of posting this order.
+      PostInvoice: true,
       TaxReportingTRCurrency: user?.store?.currency || 'ZMW',
       TRRateType: 'SP',
       TRRateDate: orderDate,
