@@ -70,6 +70,17 @@ If `SYNC_SERVER_TOKEN` is set, requests must send:
 
 `Authorization: Bearer <token>`
 
+Reconciliation password endpoints:
+
+- `POST /api/recon/auth/change-password` (Bearer token required)
+- `POST /api/recon/auth/forgot-password` with `{ "email": "..." }`
+- `POST /api/recon/auth/reset-password` with `{ "email": "...", "otp": "123456", "newPassword": "..." }`
+
+OTP email requires `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and optionally
+`SMTP_FROM`, `SMTP_SECURE`, `SMTP_TLS_REJECT_UNAUTHORIZED`, `COMPANY_NAME`,
+`PASSWORD_RESET_OTP_TTL_MINUTES`, `PASSWORD_RESET_OTP_MAX_ATTEMPTS`,
+`PASSWORD_RESET_OTP_RESEND_SECONDS`, and `PASSWORD_RESET_OTP_SECRET`.
+
 ## Expected ingest payload
 
 ```json

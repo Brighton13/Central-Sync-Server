@@ -7,6 +7,7 @@ const modelDefinitions = [
   require('./customerDirectory'),
   require('./reconAuditLog'),
   require('./reconUser'),
+  require('./passwordResetOtp'),
   require('./reconBatch'),
   require('./reconSale'),
   require('./reconCreditNote'),

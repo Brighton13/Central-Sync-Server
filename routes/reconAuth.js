@@ -13,6 +13,15 @@ const {
   buildTargetFromReconUser,
   logReconRequestAudit,
 } = require('../services/reconAuditLogService');
+const {
+  OTP_MAX_ATTEMPTS,
+  OTP_RESEND_SECONDS,
+  OTP_TTL_MINUTES,
+  generateOtp,
+  hashOtp,
+  otpMatches,
+  sendPasswordResetOtp,
+} = require('../services/passwordResetService');
 
 const router = express.Router();
 
@@ -90,6 +99,78 @@ router.get('/me', reconAuth, async (req, res) => {
   }
 
   return res.json({ success: true, user: sanitizeReconUser(user) });
+});
+
+router.post('/change-password', reconAuth, async (req, res) => {
+  const models = req.app.locals.models;
+  const currentPassword = String(req.body?.currentPassword || '');
+  const newPassword = String(req.body?.newPassword || '');
+  const user = await models.reconUser.findByPk(req.reconUser.sub);
+
+  if (!user || !user.active) return res.status(401).json({ message: 'Session is no longer valid' });
+  if (!currentPassword || !newPassword) return res.status(400).json({ message: 'Current password and new password are required' });
+  if (newPassword.length < 8) return res.status(400).json({ message: 'New password must be at least 8 characters' });
+  if (!verifyPassword(currentPassword, user.password_hash)) {
+    await logReconRequestAudit(models, req, { action: 'auth.password_change', outcome: 'failure', entityType: 'auth', ...buildActorFromReconUser(user), ...buildTargetFromReconUser(user), details: { reason: 'Current password is incorrect' } });
+    return res.status(401).json({ message: 'Current password is incorrect' });
+  }
+  if (verifyPassword(newPassword, user.password_hash)) return res.status(400).json({ message: 'New password must be different from the current password' });
+
+  await user.update({ password_hash: hashPassword(newPassword) });
+  await logReconRequestAudit(models, req, { action: 'auth.password_change', outcome: 'success', entityType: 'auth', ...buildActorFromReconUser(user), ...buildTargetFromReconUser(user) });
+  return res.json({ success: true, message: 'Password changed successfully' });
+});
+
+router.post('/forgot-password', async (req, res) => {
+  const models = req.app.locals.models;
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ message: 'Email is required' });
+  const genericResponse = { success: true, message: 'If an active account exists for that email, a reset code has been sent' };
+  const user = await models.reconUser.findOne({ where: { email } });
+  if (!user || !user.active) {
+    await logReconRequestAudit(models, req, { action: 'auth.password_reset_requested', outcome: 'success', entityType: 'auth', target_identifier: email, details: { accountMatched: false } });
+    return res.json(genericResponse);
+  }
+
+  const latest = await models.passwordResetOtp.findOne({ where: { user_id: user.id }, order: [['created_at', 'DESC']] });
+  if (latest && Date.now() - new Date(latest.createdAt).getTime() < OTP_RESEND_SECONDS * 1000) return res.json(genericResponse);
+
+  const otp = generateOtp();
+  const record = await models.passwordResetOtp.create({ user_id: user.id, otp_hash: hashOtp(user.id, otp), expires_at: new Date(Date.now() + OTP_TTL_MINUTES * 60_000) });
+  try {
+    await sendPasswordResetOtp(user, otp);
+  } catch (error) {
+    await record.destroy();
+    console.error('[password-reset] Failed to send OTP:', error.message);
+    return res.status(503).json({ success: false, message: 'Unable to send reset code right now. Please try again later' });
+  }
+  await logReconRequestAudit(models, req, { action: 'auth.password_reset_requested', outcome: 'success', entityType: 'auth', ...buildTargetFromReconUser(user) });
+  return res.json(genericResponse);
+});
+
+router.post('/reset-password', async (req, res) => {
+  const models = req.app.locals.models;
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const otp = String(req.body?.otp || '').trim();
+  const newPassword = String(req.body?.newPassword || '');
+  if (!email || !/^\d{6}$/.test(otp) || !newPassword) return res.status(400).json({ message: 'Email, a valid 6-digit code, and new password are required' });
+  if (newPassword.length < 8) return res.status(400).json({ message: 'New password must be at least 8 characters' });
+
+  const user = await models.reconUser.findOne({ where: { email } });
+  const record = user && await models.passwordResetOtp.findOne({ where: { user_id: user.id, consumed_at: null }, order: [['created_at', 'DESC']] });
+  const invalid = !user || !user.active || !record || new Date(record.expires_at).getTime() < Date.now() || record.attempts >= OTP_MAX_ATTEMPTS;
+  if (invalid || !otpMatches(user.id, otp, record.otp_hash)) {
+    if (record && record.attempts < OTP_MAX_ATTEMPTS) await record.increment('attempts');
+    await logReconRequestAudit(models, req, { action: 'auth.password_reset', outcome: 'failure', entityType: 'auth', target_identifier: email, details: { reason: 'Invalid or expired reset code' } });
+    return res.status(400).json({ message: 'Invalid or expired reset code' });
+  }
+
+  await models.sequelize.transaction(async (transaction) => {
+    await user.update({ password_hash: hashPassword(newPassword) }, { transaction });
+    await models.passwordResetOtp.update({ consumed_at: new Date() }, { where: { user_id: user.id, consumed_at: null }, transaction });
+  });
+  await logReconRequestAudit(models, req, { action: 'auth.password_reset', outcome: 'success', entityType: 'auth', ...buildTargetFromReconUser(user) });
+  return res.json({ success: true, message: 'Password reset successfully' });
 });
 
 router.get('/users', reconAuth, requireReconRole('admin'), async (req, res) => {
