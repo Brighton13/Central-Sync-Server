@@ -871,11 +871,12 @@ router.get('/summary', reconAuth, async (req, res) => {
     order: [['received_at', 'DESC'], ['sync_event_id', 'DESC']],
   });
   const [totalSalesCount, postedSalesCount, totalSalesValue, totalCreditNotesCount,
-    totalCreditNotesValue, saleGroups, recentProjectionExports] = await Promise.all([
+    postedCreditNotesCount, totalCreditNotesValue, saleGroups, recentProjectionExports] = await Promise.all([
     models.reconSale.count({ where: saleWhere }),
     models.reconSale.count({ where: { ...saleWhere, posted_to_sage: true } }),
     models.reconSale.sum('total_amount', { where: saleWhere }),
     models.reconCreditNote.count({ where: creditWhere }),
+    models.reconCreditNote.count({ where: { ...creditWhere, posted_to_sage: true } }),
     models.reconCreditNote.sum('total_amount', { where: creditWhere }),
     models.reconSale.findAll({
       attributes: [
@@ -1015,6 +1016,8 @@ router.get('/summary', reconAuth, async (req, res) => {
       pendingSalesCount: Math.max(totalSalesCount - postedSalesCount, 0),
       totalSalesValue: roundCurrency(totalSalesValue),
       totalCreditNotesCount,
+      postedCreditNotesCount,
+      pendingCreditNotesCount: Math.max(totalCreditNotesCount - postedCreditNotesCount, 0),
       totalCreditNotesValue: roundCurrency(totalCreditNotesValue),
       documentSummary,
     },
