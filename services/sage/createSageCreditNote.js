@@ -56,10 +56,32 @@ class SageCreditNoteService {
   }
 
   resolveNoteDate(creditNote, fallbackDate) {
-    return creditNote?.sage_invoice_date
+    return this.resolveSageBusinessDate(
+      fallbackDate
       || creditNote?.credit_note_date
-      || fallbackDate
-      || new Date().toISOString();
+      || creditNote?.sage_invoice_date
+      || new Date()
+    );
+  }
+
+  resolveBusinessDateKey(date) {
+    const raw = String(date || '').trim();
+    const directDateMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (directDateMatch) {
+      return `${directDateMatch[1]}-${directDateMatch[2]}-${directDateMatch[3]}`;
+    }
+
+    const parsed = date ? new Date(date) : new Date();
+    if (Number.isNaN(parsed.getTime())) {
+      throw new Error('A valid business date is required for Sage credit-note posting');
+    }
+
+    return parsed.toISOString().slice(0, 10);
+  }
+
+  resolveSageBusinessDate(date) {
+    const dateKey = this.resolveBusinessDateKey(date);
+    return `${dateKey}T12:00:00.000Z`;
   }
 
   resolveOriginalSaleReceipt(creditNote) {
@@ -76,7 +98,7 @@ class SageCreditNoteService {
   }
 
   buildFiscalPeriod(dateValue) {
-    const month = new Date(dateValue).getUTCMonth() + 1;
+    const month = Number(this.resolveBusinessDateKey(dateValue).slice(5, 7));
     return `Num${month}`;
   }
 
@@ -197,7 +219,6 @@ class SageCreditNoteService {
 
   buildCreditDebitNote(creditNote, items, user, originalSale = null, options = {}) {
     const noteDate = this.resolveNoteDate(creditNote, options.date);
-    const parsedDate = new Date(noteDate);
     const creditNoteRef = creditNote?.reference || creditNote?.receipt_number || `CN-${creditNote?.id}`;
     const creditDebitNoteNumber = options.creditDebitNoteNumber || creditNoteRef;
     const customerName = creditNote?.customer?.name || user?.store?.store_location || 'POS Customer';
@@ -219,7 +240,7 @@ class SageCreditNoteService {
       DefaultPriceListCode: user?.store?.price_list_code || '01',
       Description: creditNote?.notes || `POS credit note ${creditNoteRef}`,
       CreditDebitNoteDate: noteDate,
-      CreditDebitNoteFiscalYear: String(parsedDate.getUTCFullYear()),
+      CreditDebitNoteFiscalYear: this.resolveBusinessDateKey(noteDate).slice(0, 4),
       CreditDebitNoteFiscalPeriod: this.buildFiscalPeriod(noteDate),
       ReturnDate: noteDate,
       CreditDebitNoteHomeCurrency: currency,
@@ -332,7 +353,7 @@ class SageCreditNoteService {
 
         if (!result) {
           const creditDebitNote = this.buildCreditDebitNote(creditNote, items, creditNote.cashier || user, null, {
-            date: creditNote.sage_invoice_date || date,
+            date,
             creditDebitNoteNumber: creditNoteRef,
             orderNumber: creditNote.sage_order_number,
             invoiceNumber: creditNote.sage_invoice_number,

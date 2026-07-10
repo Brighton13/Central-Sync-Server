@@ -34,6 +34,10 @@ class EventDispatchService {
     ).trim() || '000';
   }
 
+  resolveDayEndDate(payload) {
+    return payload?.date || payload?.business_date || payload?.day_end_date || null;
+  }
+
   buildSalesDataArray(sales) {
     return (sales || []).map((sale) => ({
       saleReference: `SALE-${String(sale.receipt_number || sale.id)}-${String(sale.id)}`,
@@ -171,10 +175,11 @@ class EventDispatchService {
       const user = pendingCreditNotes[0]?.cashier || null;
       const branchId = this.resolveBranchId(payload, user);
       const terminalId = this.resolveTerminalId(payload, user);
+      const dayEndDate = this.resolveDayEndDate(payload);
       const result = await this.sageCreditNoteService.createConsolidatedCreditNoteReturn(
         pendingCreditNotes,
         user,
-        payload.date,
+        dayEndDate,
         {
           orderReference: syncEvent.idempotency_key,
           branchId,
@@ -227,10 +232,11 @@ class EventDispatchService {
       const user = this.buildUserContextFromSales(pendingSales);
       const branchId = this.resolveBranchId(payload, user);
       const terminalId = this.resolveTerminalId(payload, user);
+      const dayEndDate = this.resolveDayEndDate(payload);
       const result = await this.sageOrdersService.createConsolidatedOrder(
         salesDataArray,
         user,
-        payload.date,
+        dayEndDate,
         terminalId,
         {
           branchId,

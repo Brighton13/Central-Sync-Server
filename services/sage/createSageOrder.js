@@ -11,7 +11,7 @@ class SageOrdersService {
 
   buildDayEndOrderNumber(branchId, date) {
     const normalizedBranchId = String(branchId || '').trim().replace(/[^A-Za-z0-9]/g, '');
-    const datePart = String(date || '').trim().slice(0, 10).replace(/-/g, '');
+    const datePart = this.resolveBusinessDateKey(date).replace(/-/g, '');
 
     if (!normalizedBranchId) {
       throw new Error('A branch ID is required to build the Sage day-end order number');
@@ -22,6 +22,28 @@ class SageOrdersService {
     }
 
     return `${normalizedBranchId}-${datePart}`;
+  }
+
+  resolveBusinessDateKey(date) {
+    const raw = String(date || '').trim();
+    const directDateMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (directDateMatch) {
+      return `${directDateMatch[1]}-${directDateMatch[2]}-${directDateMatch[3]}`;
+    }
+
+    const parsed = date ? new Date(date) : new Date();
+    if (Number.isNaN(parsed.getTime())) {
+      throw new Error('A valid day-end date is required for Sage posting');
+    }
+
+    return parsed.toISOString().slice(0, 10);
+  }
+
+  resolveSageBusinessDate(date) {
+    const dateKey = this.resolveBusinessDateKey(date);
+    // Anchor at midday UTC so Sage keeps the intended business date even if the
+    // web API/database applies a local timezone conversion while posting to GL.
+    return `${dateKey}T12:00:00.000Z`;
   }
 
   getAuthConfig() {
@@ -70,7 +92,8 @@ class SageOrdersService {
   }
 
   buildConsolidatedOrder(salesDataArray, user, date, terminalId, orderReference, options = {}) {
-    const orderDate = date ? new Date(date).toISOString() : new Date().toISOString();
+    const orderDate = this.resolveSageBusinessDate(date);
+    const businessDateKey = this.resolveBusinessDateKey(date);
     const orderNumber = this.buildDayEndOrderNumber(options.branchId, date);
     let detailIndex = 0;
     const orderDetails = [];
@@ -119,15 +142,16 @@ class SageOrdersService {
       ShipToName: user?.store?.store_location || salesDataArray[0]?.salesData?.customer?.name || 'POS Customer',
       ShipToAddressLine1: '',
       ShipToCity: '',
-      OrderDescription: this.buildOrderDescription(options.branchId, terminalId, orderDate),
+      OrderDescription: this.buildOrderDescription(options.branchId, terminalId, businessDateKey),
       CustomerDiscountLevel: 'Base',
       DefaultPriceListCode: user?.store?.price_list_code || '01',
       TermsCode: user?.store?.terms_code || 'COD',
       OrderType: 'Active',
       OrderDate: orderDate,
+      PostingDate: orderDate,
       ExpectedShipDate: orderDate,
-      OrderFiscalYear: String(new Date(orderDate).getUTCFullYear()),
-      OrderFiscalPeriod: `Num${new Date(orderDate).getUTCMonth() + 1}`,
+      OrderFiscalYear: businessDateKey.slice(0, 4),
+      OrderFiscalPeriod: `Num${Number(businessDateKey.slice(5, 7))}`,
       DefaultLocationCode: user?.store?.store_number || '',
       OnHold: false,
       OrderHomeCurrency: user?.store?.currency || 'ZMW',
