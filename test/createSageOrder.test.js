@@ -37,15 +37,46 @@ test('day-end order payload ships all quantities and creates the invoice', () =>
   assert.equal(payload.TRRateDate, '2026-07-02T12:00:00.000Z');
   assert.equal(payload.OrderFiscalYear, '2026');
   assert.equal(payload.OrderFiscalPeriod, 'Num7');
-  assert.deepEqual(payload.OrderOptionalFields, [{
-    OrderUniquifier: 0,
-    OptionalField: 'ISAUTOMATIC',
-    Value: 'YES',
-    YesNoValue: true,
-    UpdateOperation: 'Unspecified',
-  }]);
+  assert.equal(payload.OrderOptionalFields, undefined);
   assert.equal(payload.OrderDetails[0].QuantityOrdered, 2);
   assert.equal(payload.OrderDetails[0].QuantityShipped, 2);
+});
+
+test('ISAUTOMATIC optional field is opt-in for Sage sites that support it', () => {
+  const original = process.env.SAGE_INCLUDE_ISAUTOMATIC_OPTIONAL_FIELD;
+  process.env.SAGE_INCLUDE_ISAUTOMATIC_OPTIONAL_FIELD = 'true';
+
+  try {
+    const service = new SageOrdersService();
+    const payload = service.buildConsolidatedOrder([
+      {
+        saleReference: 'SALE-RCP-1',
+        items: [{ product_code: 'ITEM-1', quantity: 2, unit_price: 10 }],
+        salesData: { total_amount: 20 },
+      },
+    ], {
+      store: {
+        store_number: 'MAIN',
+        store_customer_number: '1101',
+        currency: 'ZMW',
+        store_tax_group: 'VATZMW',
+      },
+    }, '2026-07-02', 'T01', 'day-end-key', { branchId: '001' });
+
+    assert.deepEqual(payload.OrderOptionalFields, [{
+      OrderUniquifier: 0,
+      OptionalField: 'ISAUTOMATIC',
+      Value: 'YES',
+      YesNoValue: true,
+      UpdateOperation: 'Unspecified',
+    }]);
+  } finally {
+    if (original === undefined) {
+      delete process.env.SAGE_INCLUDE_ISAUTOMATIC_OPTIONAL_FIELD;
+    } else {
+      process.env.SAGE_INCLUDE_ISAUTOMATIC_OPTIONAL_FIELD = original;
+    }
+  }
 });
 
 test('day-end order payload keeps the supplied business date instead of the posting day', () => {
@@ -117,4 +148,63 @@ test('day-end order posting reuses an existing Sage order with the same order nu
   assert.equal(result.existingOrderMatchedBy, 'OrderNumber');
   assert.equal(result.orderNumber, '001-20260705');
   assert.equal(result.orderReference, 'existing-reference');
+});
+
+test('422 retry removes malformed optional fields before reposting', async () => {
+  const service = new SageOrdersService();
+  service.getAuthConfig = () => ({ baseUrl: 'http://sage.example', headers: {} });
+  service.findOrderByReference = async () => null;
+  service.findOrderByNumber = async () => null;
+
+  const postedOrders = [];
+  service.buildOrderOptionalFields = () => [{
+    OrderUniquifier: 0,
+    Value: 'YES',
+    YesNoValue: true,
+    UpdateOperation: 'Unspecified',
+  }];
+  service.postOrder = async (_baseUrl, _headers, order) => {
+    postedOrders.push(order);
+    if (postedOrders.length === 1) {
+      const error = new Error('Request failed with status code 422');
+      error.response = {
+        status: 422,
+        data: { error: { message: { OrderOptionalFields: ['OptionalField is required'] } } },
+      };
+      throw error;
+    }
+
+    return {
+      status: 201,
+      data: {
+        OrderNumber: order.OrderNumber,
+        OrderUniquifier: 456,
+        OrderReference: order.OrderReference,
+      },
+    };
+  };
+
+  const result = await service.createConsolidatedOrder([
+    {
+      saleReference: 'SALE-RCP-4',
+      items: [{ product_code: 'ITEM-4', quantity: 1, unit_price: 12 }],
+      salesData: { total_amount: 12 },
+    },
+  ], {
+    store: {
+      store_number: 'MAIN',
+      store_customer_number: '1101',
+      currency: 'ZMW',
+      store_tax_group: 'VATZMW',
+    },
+  }, '2026-07-06', 'T01', {
+    branchId: '001',
+    orderReference: 'retry-reference',
+  });
+
+  assert.equal(postedOrders.length, 2);
+  assert.equal(postedOrders[0].OrderOptionalFields.length, 1);
+  assert.equal(postedOrders[1].OrderOptionalFields, undefined);
+  assert.equal(result.success, true);
+  assert.equal(result.retriedWithoutAutomaticOptionalField, true);
 });

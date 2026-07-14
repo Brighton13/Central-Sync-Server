@@ -73,6 +73,24 @@ class SageOrdersService {
     return Number(numeric.toFixed(4));
   }
 
+  shouldIncludeAutomaticOptionalField() {
+    return String(process.env.SAGE_INCLUDE_ISAUTOMATIC_OPTIONAL_FIELD || 'false').toLowerCase() === 'true';
+  }
+
+  buildOrderOptionalFields() {
+    if (!this.shouldIncludeAutomaticOptionalField()) {
+      return [];
+    }
+
+    return [{
+      OrderUniquifier: 0,
+      OptionalField: 'ISAUTOMATIC',
+      Value: 'YES',
+      YesNoValue: true,
+      UpdateOperation: 'Unspecified',
+    }];
+  }
+
   normalizeItem(item) {
     const quantity = Number(item.quantity || 0);
     const unitPrice = Number(item.unit_price || 0);
@@ -132,15 +150,8 @@ class SageOrdersService {
     const totalFromSales = salesDataArray.reduce((sum, saleData) => sum + (Number(saleData.salesData?.total_amount) || 0), 0);
     const fallbackFromLines = orderDetails.reduce((sum, line) => sum + (Number(line.OrderUnitPrice) * Number(line.QuantityOrdered)), 0);
     const orderTotal = this.to4(totalFromSales || fallbackFromLines);
-    const orderOptionalFields = [{
-      OrderUniquifier: 0,
-      OptionalField: 'ISAUTOMATIC',
-      Value: 'YES',
-      YesNoValue: true,
-      UpdateOperation: 'Unspecified',
-    }];
-
-    return {
+    const orderOptionalFields = this.buildOrderOptionalFields();
+    const order = {
       OrderUniquifier: 0,
       OrderNumber: orderNumber,
       OrderReference: orderReference || '',
@@ -182,13 +193,18 @@ class SageOrdersService {
       TRRate: 1,
       TRRateDateMatching: 1,
       TRRateOperator: 1,
-      OrderOptionalFields: orderOptionalFields,
       OrderDetails: orderDetails,
       OrderTotal: orderTotal,
       OrderInclTaxTotal: orderTotal,
       NumberOfLinesOnOrder: orderDetails.length,
       UpdateOperation: 'Unspecified'
     };
+
+    if (orderOptionalFields.length > 0) {
+      order.OrderOptionalFields = orderOptionalFields;
+    }
+
+    return order;
   }
 
   summarizeOrderForError(order) {
@@ -218,9 +234,17 @@ class SageOrdersService {
     return (order?.OrderOptionalFields || []).some((field) => field.OptionalField === 'ISAUTOMATIC');
   }
 
+  hasMalformedOptionalField(order) {
+    return (order?.OrderOptionalFields || []).some((field) => !field.OptionalField);
+  }
+
+  hasRetryableOptionalField(order) {
+    return this.hasAutomaticOptionalField(order) || this.hasMalformedOptionalField(order);
+  }
+
   shouldRetryWithoutAutomaticOptionalField(error, order) {
     return error?.response?.status === 422
-      && this.hasAutomaticOptionalField(order)
+      && this.hasRetryableOptionalField(order)
       && String(process.env.SAGE_RETRY_WITHOUT_ISAUTOMATIC_ON_422 || 'true').toLowerCase() !== 'false';
   }
 
@@ -228,7 +252,7 @@ class SageOrdersService {
     const fallbackOrder = {
       ...order,
       OrderDetails: order.OrderDetails,
-      OrderOptionalFields: (order.OrderOptionalFields || []).filter((field) => field.OptionalField !== 'ISAUTOMATIC'),
+      OrderOptionalFields: (order.OrderOptionalFields || []).filter((field) => field.OptionalField && field.OptionalField !== 'ISAUTOMATIC'),
     };
 
     if (fallbackOrder.OrderOptionalFields.length === 0) {
@@ -238,15 +262,56 @@ class SageOrdersService {
     return fallbackOrder;
   }
 
+  extractSageErrorMessage(payload) {
+    const message = payload?.error?.message || payload?.message || payload?.Message || null;
+
+    if (typeof message === 'string') {
+      return message;
+    }
+
+    if (Array.isArray(message)) {
+      return message.filter((entry) => typeof entry === 'string').join('; ') || null;
+    }
+
+    if (message && typeof message === 'object') {
+      const values = Object.values(message).flatMap((value) => {
+        if (typeof value === 'string') {
+          return [value];
+        }
+
+        if (Array.isArray(value)) {
+          return value.filter((entry) => typeof entry === 'string');
+        }
+
+        return [];
+      });
+
+      return values.join('; ') || null;
+    }
+
+    return null;
+  }
+
   enrichSagePostError(error, order, context = {}) {
+    const sageResponse = error.response?.data || null;
+    const sageMessage = this.extractSageErrorMessage(sageResponse);
     error.sageErrorPayload = {
       message: error.message,
+      sageMessage,
       status: error.response?.status || null,
-      sageResponse: error.response?.data || null,
+      sageResponse,
       request: this.summarizeOrderForError(order),
       ...context,
     };
     return error;
+  }
+
+  formatForLog(payload) {
+    try {
+      return JSON.stringify(payload, null, 2);
+    } catch (error) {
+      return payload;
+    }
   }
 
   async postOrder(baseUrl, headers, order) {
@@ -372,11 +437,12 @@ class SageOrdersService {
       optionalFieldRetry = true;
       const fallbackOrder = this.withoutAutomaticOptionalField(order);
 
-      console.warn('[SageOrdersService] Sage rejected OE order with ISAUTOMATIC optional field; retrying without it.', {
+      console.warn('[SageOrdersService] Sage rejected OE order optional fields; retrying without them.', this.formatForLog({
         status: error.response?.status,
+        sageMessage: this.extractSageErrorMessage(error.response?.data || null),
         sageResponse: error.response?.data || null,
         order: this.summarizeOrderForError(order),
-      });
+      }));
 
       try {
         response = await this.postOrder(baseUrl, headers, fallbackOrder);

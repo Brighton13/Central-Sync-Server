@@ -78,12 +78,17 @@ function createSageWorker(models) {
         return result;
       } catch (error) {
         const retryCount = (syncEvent.retry_count || 0) + 1;
+        const sageErrorPayload = error.sageErrorPayload || error.response?.data || { message: error.message };
+        const lastError = error.sageErrorPayload?.sageMessage
+          || error.response?.data?.error?.message
+          || error.response?.data?.message
+          || error.message;
 
         await syncEvent.update({
           status: 'queued',
           retry_count: retryCount,
-          last_error: error.message,
-          response_payload: error.sageErrorPayload || error.response?.data || { message: error.message },
+          last_error: typeof lastError === 'string' ? lastError : error.message,
+          response_payload: sageErrorPayload,
           last_attempt_at: new Date(),
           queued_at: new Date(),
         });
