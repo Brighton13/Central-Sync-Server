@@ -191,6 +191,71 @@ class SageOrdersService {
     };
   }
 
+  summarizeOrderForError(order) {
+    return {
+      OrderNumber: order?.OrderNumber || null,
+      OrderReference: order?.OrderReference || null,
+      OrderDate: order?.OrderDate || null,
+      PostingDate: order?.PostingDate || null,
+      ExpectedShipDate: order?.ExpectedShipDate || null,
+      CustomerNumber: order?.CustomerNumber || null,
+      DefaultLocationCode: order?.DefaultLocationCode || null,
+      PostInvoice: order?.PostInvoice,
+      OrderOptionalFields: order?.OrderOptionalFields || [],
+      NumberOfLinesOnOrder: order?.NumberOfLinesOnOrder || 0,
+      FirstOrderDetails: (order?.OrderDetails || []).slice(0, 3).map((line) => ({
+        LineNumber: line.LineNumber,
+        Item: line.Item,
+        Location: line.Location,
+        QuantityOrdered: line.QuantityOrdered,
+        QuantityShipped: line.QuantityShipped,
+        OrderUnitPrice: line.OrderUnitPrice,
+      })),
+    };
+  }
+
+  hasAutomaticOptionalField(order) {
+    return (order?.OrderOptionalFields || []).some((field) => field.OptionalField === 'ISAUTOMATIC');
+  }
+
+  shouldRetryWithoutAutomaticOptionalField(error, order) {
+    return error?.response?.status === 422
+      && this.hasAutomaticOptionalField(order)
+      && String(process.env.SAGE_RETRY_WITHOUT_ISAUTOMATIC_ON_422 || 'true').toLowerCase() !== 'false';
+  }
+
+  withoutAutomaticOptionalField(order) {
+    const fallbackOrder = {
+      ...order,
+      OrderDetails: order.OrderDetails,
+      OrderOptionalFields: (order.OrderOptionalFields || []).filter((field) => field.OptionalField !== 'ISAUTOMATIC'),
+    };
+
+    if (fallbackOrder.OrderOptionalFields.length === 0) {
+      delete fallbackOrder.OrderOptionalFields;
+    }
+
+    return fallbackOrder;
+  }
+
+  enrichSagePostError(error, order, context = {}) {
+    error.sageErrorPayload = {
+      message: error.message,
+      status: error.response?.status || null,
+      sageResponse: error.response?.data || null,
+      request: this.summarizeOrderForError(order),
+      ...context,
+    };
+    return error;
+  }
+
+  async postOrder(baseUrl, headers, order) {
+    return axios.post(`${baseUrl}/OE/OEOrders`, order, {
+      headers,
+      timeout: this.timeout,
+    });
+  }
+
   normalizeOrderResponse(orderData, status, salesDataArray, order, terminalId, options = {}) {
     return {
       success: true,
@@ -206,6 +271,8 @@ class SageOrdersService {
       orderUniquifier: orderData?.OrderUniquifier == null ? null : String(orderData.OrderUniquifier),
       orderReference: orderData?.OrderReference || options.orderReference || '',
       existingOrder: Boolean(options.existingOrder),
+      existingOrderMatchedBy: options.existingOrderMatchedBy || null,
+      retriedWithoutAutomaticOptionalField: Boolean(options.optionalFieldRetry),
     };
   }
 
@@ -283,14 +350,51 @@ class SageOrdersService {
       }
     }
 
-    const response = await axios.post(`${baseUrl}/OE/OEOrders`, order, {
-      headers,
-      timeout: this.timeout,
-    });
+    const existingOrderByNumber = await this.findOrderByNumber(order.OrderNumber);
+    if (existingOrderByNumber) {
+      return this.normalizeOrderResponse(existingOrderByNumber, 200, salesDataArray, order, terminalId, {
+        orderReference: options.orderReference,
+        existingOrder: true,
+        existingOrderMatchedBy: 'OrderNumber',
+      });
+    }
+
+    let response;
+    let optionalFieldRetry = false;
+
+    try {
+      response = await this.postOrder(baseUrl, headers, order);
+    } catch (error) {
+      if (!this.shouldRetryWithoutAutomaticOptionalField(error, order)) {
+        throw this.enrichSagePostError(error, order);
+      }
+
+      optionalFieldRetry = true;
+      const fallbackOrder = this.withoutAutomaticOptionalField(order);
+
+      console.warn('[SageOrdersService] Sage rejected OE order with ISAUTOMATIC optional field; retrying without it.', {
+        status: error.response?.status,
+        sageResponse: error.response?.data || null,
+        order: this.summarizeOrderForError(order),
+      });
+
+      try {
+        response = await this.postOrder(baseUrl, headers, fallbackOrder);
+      } catch (retryError) {
+        throw this.enrichSagePostError(retryError, fallbackOrder, {
+          retriedWithoutAutomaticOptionalField: true,
+          firstAttempt: {
+            status: error.response?.status || null,
+            sageResponse: error.response?.data || null,
+          },
+        });
+      }
+    }
 
     return this.normalizeOrderResponse(response.data, response.status, salesDataArray, order, terminalId, {
       orderReference: options.orderReference,
       existingOrder: false,
+      optionalFieldRetry,
     });
   }
 }

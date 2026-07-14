@@ -83,7 +83,7 @@ function createSageWorker(models) {
           status: 'queued',
           retry_count: retryCount,
           last_error: error.message,
-          response_payload: error.response?.data || { message: error.message },
+          response_payload: error.sageErrorPayload || error.response?.data || { message: error.message },
           last_attempt_at: new Date(),
           queued_at: new Date(),
         });

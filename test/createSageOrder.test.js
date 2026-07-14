@@ -80,3 +80,41 @@ test('dispatcher resolves day-end date aliases before Sage posting', () => {
   assert.equal(service.resolveDayEndDate({ business_date: '2026-07-03' }), '2026-07-03');
   assert.equal(service.resolveDayEndDate({ day_end_date: '2026-07-04' }), '2026-07-04');
 });
+
+test('day-end order posting reuses an existing Sage order with the same order number', async () => {
+  const service = new SageOrdersService();
+  service.getAuthConfig = () => ({ baseUrl: 'http://sage.example', headers: {} });
+  service.findOrderByReference = async () => null;
+  service.findOrderByNumber = async (orderNumber) => ({
+    OrderNumber: orderNumber,
+    OrderUniquifier: 123,
+    OrderReference: 'existing-reference',
+  });
+  service.postOrder = async () => {
+    throw new Error('postOrder should not be called when order number already exists');
+  };
+
+  const result = await service.createConsolidatedOrder([
+    {
+      saleReference: 'SALE-RCP-3',
+      items: [{ product_code: 'ITEM-3', quantity: 1, unit_price: 12 }],
+      salesData: { total_amount: 12 },
+    },
+  ], {
+    store: {
+      store_number: 'MAIN',
+      store_customer_number: '1101',
+      currency: 'ZMW',
+      store_tax_group: 'VATZMW',
+    },
+  }, '2026-07-05', 'T01', {
+    branchId: '001',
+    orderReference: 'new-reference',
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.existingOrder, true);
+  assert.equal(result.existingOrderMatchedBy, 'OrderNumber');
+  assert.equal(result.orderNumber, '001-20260705');
+  assert.equal(result.orderReference, 'existing-reference');
+});
