@@ -37,6 +37,13 @@ test('day-end order payload ships all quantities and creates the invoice', () =>
   assert.equal(payload.TRRateDate, '2026-07-02T12:00:00.000Z');
   assert.equal(payload.OrderFiscalYear, '2026');
   assert.equal(payload.OrderFiscalPeriod, 'Num7');
+  assert.deepEqual(payload.OrderOptionalFields, [{
+    OrderUniquifier: 0,
+    OptionalField: 'ISAUTOMATIC',
+    Value: 'YES',
+    YesNoValue: true,
+    UpdateOperation: 'Unspecified',
+  }]);
   assert.equal(payload.OrderDetails[0].QuantityOrdered, 2);
   assert.equal(payload.OrderDetails[0].QuantityShipped, 2);
 });

@@ -132,6 +132,13 @@ class SageOrdersService {
     const totalFromSales = salesDataArray.reduce((sum, saleData) => sum + (Number(saleData.salesData?.total_amount) || 0), 0);
     const fallbackFromLines = orderDetails.reduce((sum, line) => sum + (Number(line.OrderUnitPrice) * Number(line.QuantityOrdered)), 0);
     const orderTotal = this.to4(totalFromSales || fallbackFromLines);
+    const orderOptionalFields = [{
+      OrderUniquifier: 0,
+      OptionalField: 'ISAUTOMATIC',
+      Value: 'YES',
+      YesNoValue: true,
+      UpdateOperation: 'Unspecified',
+    }];
 
     return {
       OrderUniquifier: 0,
@@ -175,6 +182,7 @@ class SageOrdersService {
       TRRate: 1,
       TRRateDateMatching: 1,
       TRRateOperator: 1,
+      OrderOptionalFields: orderOptionalFields,
       OrderDetails: orderDetails,
       OrderTotal: orderTotal,
       OrderInclTaxTotal: orderTotal,
