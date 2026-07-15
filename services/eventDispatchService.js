@@ -79,7 +79,9 @@ class EventDispatchService {
   async resolvePendingSales(syncEvent, documentType) {
     const payload = syncEvent.payload || {};
     const sales = payload.sales || [];
-    const existingExports = await this.syncSaleExportService.findExportsForSales(syncEvent.store_id, sales, documentType);
+    const existingExports = await this.syncSaleExportService.findExportsForSales(syncEvent.store_id, sales, documentType, {
+      dayEndIdempotencyKey: syncEvent.idempotency_key,
+    });
     const exportedKeys = new Set(
       existingExports.map((record) => this.syncSaleExportService.buildIdentityKey(
         syncEvent.store_id,
@@ -105,7 +107,9 @@ class EventDispatchService {
   async resolvePendingCreditNotes(syncEvent, documentType) {
     const payload = syncEvent.payload || {};
     const creditNotes = payload.credit_notes || [];
-    const existingExports = await this.syncSaleExportService.findExportsForSales(syncEvent.store_id, creditNotes, documentType);
+    const existingExports = await this.syncSaleExportService.findExportsForSales(syncEvent.store_id, creditNotes, documentType, {
+      dayEndIdempotencyKey: syncEvent.idempotency_key,
+    });
     const exportedKeys = new Set(
       existingExports.map((record) => this.syncSaleExportService.buildIdentityKey(
         syncEvent.store_id,

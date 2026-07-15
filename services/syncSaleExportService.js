@@ -22,7 +22,7 @@ class SyncSaleExportService {
     };
   }
 
-  async findExportsForSales(storeId, sales, documentType) {
+  async findExportsForSales(storeId, sales, documentType, options = {}) {
     if (!sales || sales.length === 0) {
       return [];
     }
@@ -53,6 +53,7 @@ class SyncSaleExportService {
     return this.models.syncSaleExport.findAll({
       where: {
         document_type: documentType,
+        ...(options.dayEndIdempotencyKey ? { day_end_idempotency_key: options.dayEndIdempotencyKey } : {}),
         [Op.or]: orConditions,
       },
       order: [['id', 'ASC']],
@@ -151,7 +152,12 @@ class SyncSaleExportService {
         defaults,
       });
 
-      if (!record.exported_at || !record.sage_document_number || !record.day_end_idempotency_key) {
+      if (
+        !record.exported_at
+        || !record.sage_document_number
+        || !record.day_end_idempotency_key
+        || record.day_end_idempotency_key !== syncEvent.idempotency_key
+      ) {
         await record.update(defaults);
       }
 

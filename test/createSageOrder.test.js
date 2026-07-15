@@ -104,6 +104,31 @@ test('day-end order payload keeps the supplied business date instead of the post
   assert.equal(payload.OrderFiscalPeriod, 'Num6');
 });
 
+test('day-end order payload includes the store revenue account on OE details', () => {
+  const service = new SageOrdersService();
+  const payload = service.buildConsolidatedOrder([
+    {
+      saleReference: 'SALE-RCP-REV',
+      items: [{ product_code: 'ITEM-REV', quantity: 1, unit_price: 25 }],
+      salesData: { total_amount: 25 },
+    },
+  ], {
+    store: {
+      store_number: '049S',
+      store_customer_number: '1049',
+      store_rev_account: '4000-049',
+      currency: 'ZMW',
+      store_tax_group: 'VATZMW',
+    },
+  }, '2026-07-14', 'T01', 'day-end-key', { branchId: '049' });
+
+  assert.equal(payload.CustomerNumber, '1049');
+  assert.equal(payload.DefaultLocationCode, '049S');
+  assert.equal(payload.OrderDetails[0].Location, '049S');
+  assert.equal(payload.OrderDetails[0].RevenueAccount, '4000-049');
+  assert.equal(payload.PostingDate, '2026-07-14T12:00:00.000Z');
+});
+
 test('dispatcher resolves day-end date aliases before Sage posting', () => {
   const service = new EventDispatchService({});
 
@@ -207,4 +232,58 @@ test('422 retry removes malformed optional fields before reposting', async () =>
   assert.equal(postedOrders[1].OrderOptionalFields, undefined);
   assert.equal(result.success, true);
   assert.equal(result.retriedWithoutAutomaticOptionalField, true);
+});
+
+test('422 retry removes detail revenue account if Sage rejects the field', async () => {
+  const service = new SageOrdersService();
+  service.getAuthConfig = () => ({ baseUrl: 'http://sage.example', headers: {} });
+  service.findOrderByReference = async () => null;
+  service.findOrderByNumber = async () => null;
+
+  const postedOrders = [];
+  service.postOrder = async (_baseUrl, _headers, order) => {
+    postedOrders.push(order);
+    if (postedOrders.length === 1) {
+      const error = new Error('Request failed with status code 422');
+      error.response = {
+        status: 422,
+        data: { error: { message: { OrderDetails: ['RevenueAccount is not editable'] } } },
+      };
+      throw error;
+    }
+
+    return {
+      status: 201,
+      data: {
+        OrderNumber: order.OrderNumber,
+        OrderUniquifier: 789,
+        OrderReference: order.OrderReference,
+      },
+    };
+  };
+
+  const result = await service.createConsolidatedOrder([
+    {
+      saleReference: 'SALE-RCP-REV',
+      items: [{ product_code: 'ITEM-REV', quantity: 1, unit_price: 25 }],
+      salesData: { total_amount: 25 },
+    },
+  ], {
+    store: {
+      store_number: '049S',
+      store_customer_number: '1049',
+      store_rev_account: '4000-049',
+      currency: 'ZMW',
+      store_tax_group: 'VATZMW',
+    },
+  }, '2026-07-14', 'T01', {
+    branchId: '049',
+    orderReference: 'retry-revenue-reference',
+  });
+
+  assert.equal(postedOrders.length, 2);
+  assert.equal(postedOrders[0].OrderDetails[0].RevenueAccount, '4000-049');
+  assert.equal(postedOrders[1].OrderDetails[0].RevenueAccount, undefined);
+  assert.equal(result.success, true);
+  assert.equal(result.retriedWithoutDetailRevenueAccount, true);
 });

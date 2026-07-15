@@ -91,6 +91,15 @@ class SageOrdersService {
     }];
   }
 
+  shouldIncludeDetailRevenueAccount() {
+    return String(process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT || 'true').toLowerCase() !== 'false';
+  }
+
+  resolveStoreRevenueAccount(user) {
+    const value = String(user?.store?.store_rev_account || '').trim();
+    return value || null;
+  }
+
   normalizeItem(item) {
     const quantity = Number(item.quantity || 0);
     const unitPrice = Number(item.unit_price || 0);
@@ -113,6 +122,9 @@ class SageOrdersService {
     const orderDate = this.resolveSageBusinessDate(date);
     const businessDateKey = this.resolveBusinessDateKey(date);
     const orderNumber = this.buildDayEndOrderNumber(options.branchId, date);
+    const storeRevenueAccount = this.shouldIncludeDetailRevenueAccount()
+      ? this.resolveStoreRevenueAccount(user)
+      : null;
     let detailIndex = 0;
     const orderDetails = [];
 
@@ -121,7 +133,7 @@ class SageOrdersService {
 
       for (const rawItem of (saleData.items || [])) {
         const item = this.normalizeItem(rawItem);
-        orderDetails.push({
+        const orderDetail = {
           LineNumber: (detailIndex + 1) * 32,
           LineType: 'Item',
           Item: item.code,
@@ -142,7 +154,13 @@ class SageOrdersService {
           TaxClass1: 1,
           TaxIncluded1: true,
           UpdateOperation: 'Unspecified'
-        });
+        };
+
+        if (storeRevenueAccount) {
+          orderDetail.RevenueAccount = storeRevenueAccount;
+        }
+
+        orderDetails.push(orderDetail);
         detailIndex += 1;
       }
     }
@@ -242,10 +260,20 @@ class SageOrdersService {
     return this.hasAutomaticOptionalField(order) || this.hasMalformedOptionalField(order);
   }
 
+  hasDetailRevenueAccount(order) {
+    return (order?.OrderDetails || []).some((line) => line.RevenueAccount);
+  }
+
   shouldRetryWithoutAutomaticOptionalField(error, order) {
     return error?.response?.status === 422
       && this.hasRetryableOptionalField(order)
       && String(process.env.SAGE_RETRY_WITHOUT_ISAUTOMATIC_ON_422 || 'true').toLowerCase() !== 'false';
+  }
+
+  shouldRetryWithoutDetailRevenueAccount(error, order) {
+    return error?.response?.status === 422
+      && this.hasDetailRevenueAccount(order)
+      && String(process.env.SAGE_RETRY_WITHOUT_OE_DETAIL_REVENUE_ACCOUNT_ON_422 || 'true').toLowerCase() !== 'false';
   }
 
   withoutAutomaticOptionalField(order) {
@@ -260,6 +288,13 @@ class SageOrdersService {
     }
 
     return fallbackOrder;
+  }
+
+  withoutDetailRevenueAccount(order) {
+    return {
+      ...order,
+      OrderDetails: (order.OrderDetails || []).map(({ RevenueAccount, ...line }) => line),
+    };
   }
 
   extractSageErrorMessage(payload) {
@@ -338,6 +373,7 @@ class SageOrdersService {
       existingOrder: Boolean(options.existingOrder),
       existingOrderMatchedBy: options.existingOrderMatchedBy || null,
       retriedWithoutAutomaticOptionalField: Boolean(options.optionalFieldRetry),
+      retriedWithoutDetailRevenueAccount: Boolean(options.revenueAccountRetry),
     };
   }
 
@@ -426,10 +462,43 @@ class SageOrdersService {
 
     let response;
     let optionalFieldRetry = false;
+    let revenueAccountRetry = false;
 
     try {
       response = await this.postOrder(baseUrl, headers, order);
     } catch (error) {
+      if (this.shouldRetryWithoutDetailRevenueAccount(error, order)) {
+        revenueAccountRetry = true;
+        const fallbackOrder = this.withoutDetailRevenueAccount(order);
+
+        console.warn('[SageOrdersService] Sage rejected OE detail revenue account; retrying without it.', this.formatForLog({
+          status: error.response?.status,
+          sageMessage: this.extractSageErrorMessage(error.response?.data || null),
+          sageResponse: error.response?.data || null,
+          order: this.summarizeOrderForError(order),
+        }));
+
+        try {
+          response = await this.postOrder(baseUrl, headers, fallbackOrder);
+        } catch (retryError) {
+          throw this.enrichSagePostError(retryError, fallbackOrder, {
+            retriedWithoutDetailRevenueAccount: true,
+            firstAttempt: {
+              status: error.response?.status || null,
+              sageResponse: error.response?.data || null,
+            },
+          });
+        }
+      }
+
+      if (response) {
+        return this.normalizeOrderResponse(response.data, response.status, salesDataArray, order, terminalId, {
+          orderReference: options.orderReference,
+          existingOrder: false,
+          revenueAccountRetry,
+        });
+      }
+
       if (!this.shouldRetryWithoutAutomaticOptionalField(error, order)) {
         throw this.enrichSagePostError(error, order);
       }
@@ -447,20 +516,54 @@ class SageOrdersService {
       try {
         response = await this.postOrder(baseUrl, headers, fallbackOrder);
       } catch (retryError) {
-        throw this.enrichSagePostError(retryError, fallbackOrder, {
-          retriedWithoutAutomaticOptionalField: true,
-          firstAttempt: {
-            status: error.response?.status || null,
-            sageResponse: error.response?.data || null,
-          },
-        });
+        if (this.shouldRetryWithoutDetailRevenueAccount(retryError, fallbackOrder)) {
+          revenueAccountRetry = true;
+          const secondFallbackOrder = this.withoutDetailRevenueAccount(fallbackOrder);
+
+          console.warn('[SageOrdersService] Sage rejected OE detail revenue account after optional-field retry; retrying without it.', this.formatForLog({
+            status: retryError.response?.status,
+            sageMessage: this.extractSageErrorMessage(retryError.response?.data || null),
+            sageResponse: retryError.response?.data || null,
+            order: this.summarizeOrderForError(fallbackOrder),
+          }));
+
+          try {
+            response = await this.postOrder(baseUrl, headers, secondFallbackOrder);
+          } catch (secondRetryError) {
+            throw this.enrichSagePostError(secondRetryError, secondFallbackOrder, {
+              retriedWithoutAutomaticOptionalField: true,
+              retriedWithoutDetailRevenueAccount: true,
+              firstAttempt: {
+                status: error.response?.status || null,
+                sageResponse: error.response?.data || null,
+              },
+              secondAttempt: {
+                status: retryError.response?.status || null,
+                sageResponse: retryError.response?.data || null,
+              },
+            });
+          }
+        } else {
+          throw this.enrichSagePostError(retryError, fallbackOrder, {
+            retriedWithoutAutomaticOptionalField: true,
+            firstAttempt: {
+              status: error.response?.status || null,
+              sageResponse: error.response?.data || null,
+            },
+          });
+        }
       }
+    }
+
+    if (!response) {
+      throw new Error('Sage order post did not return a response');
     }
 
     return this.normalizeOrderResponse(response.data, response.status, salesDataArray, order, terminalId, {
       orderReference: options.orderReference,
       existingOrder: false,
       optionalFieldRetry,
+      revenueAccountRetry,
     });
   }
 }
