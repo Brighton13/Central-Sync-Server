@@ -14,6 +14,7 @@ const modelDefinitions = [
   require('./reconProjectionState'),
   require('./syncEvent'),
   require('./syncSaleExport'),
+  require('./knownTill'),
 ];
 
 modelDefinitions.forEach((defineModel) => {

@@ -2,6 +2,7 @@ const express = require('express');
 const syncAuth = require('../middleware/syncAuth');
 const { queueSyncEvent, SAGE_DISPATCH_QUEUE } = require('../services/syncEventQueueService');
 const { materializeSyncEvent } = require('../services/reconciliationProjectionService');
+const { registerTillFromSyncEvent } = require('../services/tillRegistryService');
 
 const router = express.Router();
 
@@ -69,6 +70,7 @@ router.post('/events', syncAuth, async (req, res) => {
     });
 
     await materializeSyncEvent(models, result[0], { transaction, advanceState: true });
+    await registerTillFromSyncEvent(models, result[0], { transaction });
     return result;
   });
 

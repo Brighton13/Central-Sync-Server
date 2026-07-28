@@ -10,6 +10,14 @@ const {
   salesProjectionToExportRow,
   creditNoteProjectionToExportRow,
 } = require('../services/reconciliationExportService');
+const {
+  getTillSyncStatus,
+  serializeKnownTill,
+} = require('../services/tillRegistryService');
+const {
+  buildActorFromReconUser,
+  logReconRequestAudit,
+} = require('../services/reconAuditLogService');
 
 const router = express.Router();
 
@@ -1041,73 +1049,155 @@ router.get('/summary', reconAuth, async (req, res) => {
   });
 });
 
-// Daily operational register used by the reconciliation dashboard. A terminal is
-// considered synced as soon as Central Sync receives at least one projected batch
-// from it during the server's current calendar day.
+function normalizeTillInput(body) {
+  const branchId = String(body?.branchId || body?.branch_id || '').trim();
+  const terminalId = String(body?.terminalId || body?.terminal_id || '').trim();
+  const terminalName = String(body?.terminalName || body?.terminal_name || '').trim();
+  const storeIdRaw = body?.storeId ?? body?.store_id;
+  const storeId = storeIdRaw === undefined || storeIdRaw === null || storeIdRaw === ''
+    ? null
+    : Number(storeIdRaw);
+
+  return {
+    branchId,
+    terminalId,
+    terminalName: terminalName || null,
+    storeId: Number.isFinite(storeId) ? storeId : null,
+    active: body?.active === undefined ? true : Boolean(body.active),
+  };
+}
+
+// Daily operational register used by the reconciliation dashboard. A till is
+// considered synced as soon as Central Sync receives any event from it today.
 router.get('/terminal-sync-status', reconAuth, async (req, res) => {
   const models = req.app.locals.models;
-  await assertProjectionReady(models);
-
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const todayEnd = new Date(todayStart);
-  todayEnd.setDate(todayEnd.getDate() + 1);
-
-  const terminalGroups = await models.reconBatch.findAll({
-    attributes: [
-      'branch_id',
-      'terminal_id',
-      [fn('MAX', col('received_at')), 'last_received_at'],
-      [fn('COUNT', col('sync_event_id')), 'batch_count'],
-    ],
-    where: {
-      terminal_id: { [Op.ne]: null },
-    },
-    group: ['branch_id', 'terminal_id'],
-    raw: true,
-  });
-
-  const terminals = terminalGroups
-    .map((row) => {
-      const lastReceivedAt = row.last_received_at ? new Date(row.last_received_at) : null;
-      const sentToday = Boolean(
-        lastReceivedAt
-        && lastReceivedAt >= todayStart
-        && lastReceivedAt < todayEnd
-      );
-      const terminalId = String(row.terminal_id);
-
-      return {
-        key: `${row.branch_id || 'Unassigned'}:${terminalId}`,
-        terminalId,
-        terminalName: `Terminal ${terminalId}`,
-        branchId: String(row.branch_id || 'Unassigned'),
-        sentToday,
-        lastReceivedAt: lastReceivedAt ? lastReceivedAt.toISOString() : null,
-        batchCount: Number(row.batch_count || 0),
-      };
-    })
-    .sort((left, right) => {
-      if (left.sentToday !== right.sentToday) return left.sentToday ? 1 : -1;
-      return left.terminalName.localeCompare(right.terminalName, undefined, { numeric: true });
-    });
-
-  const syncedCount = terminals.filter((terminal) => terminal.sentToday).length;
+  const status = await getTillSyncStatus(models);
 
   return res.json({
     success: true,
-    generatedAt: new Date().toISOString(),
-    day: {
-      start: todayStart.toISOString(),
-      end: todayEnd.toISOString(),
-    },
-    summary: {
-      totalTerminals: terminals.length,
-      syncedCount,
-      missingCount: terminals.length - syncedCount,
-    },
-    terminals,
+    ...status,
   });
+});
+
+router.post('/known-tills', reconAuth, requireReconRole('admin'), async (req, res) => {
+  const models = req.app.locals.models;
+  const input = normalizeTillInput(req.body);
+
+  if (!input.branchId || !input.terminalId) {
+    return res.status(400).json({ message: 'Branch ID and terminal ID are required' });
+  }
+
+  const [till, created] = await models.knownTill.findOrCreate({
+    where: {
+      branch_id: input.branchId,
+      terminal_id: input.terminalId,
+    },
+    defaults: {
+      branch_id: input.branchId,
+      terminal_id: input.terminalId,
+      terminal_name: input.terminalName,
+      store_id: input.storeId,
+      active: input.active,
+      source: 'manual',
+      created_by_user_id: req.reconUser.sub || null,
+      updated_by_user_id: req.reconUser.sub || null,
+    },
+  });
+
+  if (!created) {
+    await till.update({
+      terminal_name: input.terminalName,
+      store_id: input.storeId,
+      active: input.active,
+      source: 'manual',
+      updated_by_user_id: req.reconUser.sub || null,
+    });
+  }
+
+  await logReconRequestAudit(models, req, {
+    action: created ? 'known_till.create' : 'known_till.update',
+    outcome: 'success',
+    entityType: 'known_till',
+    ...buildActorFromReconUser(req.reconUser),
+    target_identifier: `${input.branchId}:${input.terminalId}`,
+    target_name: input.terminalName || null,
+    details: { branchId: input.branchId, terminalId: input.terminalId, active: input.active },
+  });
+
+  return res.status(created ? 201 : 200).json({
+    success: true,
+    till: serializeKnownTill(till),
+  });
+});
+
+router.patch('/known-tills/:id', reconAuth, requireReconRole('admin'), async (req, res) => {
+  const models = req.app.locals.models;
+  const till = await models.knownTill.findByPk(req.params.id);
+  if (!till) {
+    return res.status(404).json({ message: 'Till not found' });
+  }
+
+  const updates = {
+    updated_by_user_id: req.reconUser.sub || null,
+  };
+
+  if (req.body.branchId !== undefined || req.body.branch_id !== undefined) {
+    updates.branch_id = String(req.body.branchId || req.body.branch_id || '').trim();
+  }
+  if (req.body.terminalId !== undefined || req.body.terminal_id !== undefined) {
+    updates.terminal_id = String(req.body.terminalId || req.body.terminal_id || '').trim();
+  }
+  if (req.body.terminalName !== undefined || req.body.terminal_name !== undefined) {
+    const terminalName = String(req.body.terminalName || req.body.terminal_name || '').trim();
+    updates.terminal_name = terminalName || null;
+  }
+  if (req.body.storeId !== undefined || req.body.store_id !== undefined) {
+    const storeId = Number(req.body.storeId ?? req.body.store_id);
+    updates.store_id = Number.isFinite(storeId) ? storeId : null;
+  }
+  if (req.body.active !== undefined) {
+    updates.active = Boolean(req.body.active);
+  }
+
+  if (updates.branch_id === '' || updates.terminal_id === '') {
+    return res.status(400).json({ message: 'Branch ID and terminal ID cannot be empty' });
+  }
+
+  await till.update(updates);
+  await logReconRequestAudit(models, req, {
+    action: 'known_till.update',
+    outcome: 'success',
+    entityType: 'known_till',
+    ...buildActorFromReconUser(req.reconUser),
+    target_identifier: `${till.branch_id}:${till.terminal_id}`,
+    target_name: till.terminal_name || null,
+    details: { updatedFields: Object.keys(updates) },
+  });
+
+  return res.json({ success: true, till: serializeKnownTill(till) });
+});
+
+router.delete('/known-tills/:id', reconAuth, requireReconRole('admin'), async (req, res) => {
+  const models = req.app.locals.models;
+  const till = await models.knownTill.findByPk(req.params.id);
+  if (!till) {
+    return res.status(404).json({ message: 'Till not found' });
+  }
+
+  await till.update({
+    active: false,
+    updated_by_user_id: req.reconUser.sub || null,
+  });
+  await logReconRequestAudit(models, req, {
+    action: 'known_till.deactivate',
+    outcome: 'success',
+    entityType: 'known_till',
+    ...buildActorFromReconUser(req.reconUser),
+    target_identifier: `${till.branch_id}:${till.terminal_id}`,
+    target_name: till.terminal_name || null,
+  });
+
+  return res.json({ success: true });
 });
 
 router.get('/summary-legacy', reconAuth, async (req, res) => {

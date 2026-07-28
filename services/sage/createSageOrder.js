@@ -184,7 +184,6 @@ class SageOrdersService {
       TermsCode: user?.store?.terms_code || 'COD',
       OrderType: 'Active',
       OrderDate: orderDate,
-      PostingDate: orderDate,
       ExpectedShipDate: orderDate,
       OrderFiscalYear: businessDateKey.slice(0, 4),
       OrderFiscalPeriod: `Num${Number(businessDateKey.slice(5, 7))}`,
@@ -230,7 +229,6 @@ class SageOrdersService {
       OrderNumber: order?.OrderNumber || null,
       OrderReference: order?.OrderReference || null,
       OrderDate: order?.OrderDate || null,
-      PostingDate: order?.PostingDate || null,
       ExpectedShipDate: order?.ExpectedShipDate || null,
       CustomerNumber: order?.CustomerNumber || null,
       DefaultLocationCode: order?.DefaultLocationCode || null,
@@ -271,8 +269,10 @@ class SageOrdersService {
   }
 
   shouldRetryWithoutDetailRevenueAccount(error, order) {
+    const sageMessage = this.extractSageErrorMessage(error?.response?.data || null);
     return error?.response?.status === 422
       && this.hasDetailRevenueAccount(order)
+      && /RevenueAccount/i.test(sageMessage)
       && String(process.env.SAGE_RETRY_WITHOUT_OE_DETAIL_REVENUE_ACCOUNT_ON_422 || 'true').toLowerCase() !== 'false';
   }
 

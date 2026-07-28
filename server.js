@@ -7,12 +7,14 @@ const { sageDispatchQueue } = require('./queues/syncQueues');
 const { recoverIncompleteEvents } = require('./services/syncEventQueueService');
 const { ensureDefaultReconUsers } = require('./services/reconAuthService');
 const { backfillReconciliationProjection } = require('./services/reconciliationProjectionService');
+const { startTillStatusScheduler } = require('./services/tillStatusScheduler');
 
 const PORT = Number(process.env.PORT || 4000);
 
 app.locals.models = models;
 
 let sageWorker;
+let tillStatusScheduler;
 
 async function ensureSyncSaleExportsSchema() {
   const queryInterface = models.sequelize.getQueryInterface();
@@ -314,6 +316,8 @@ async function start() {
     console.log(`Recovered ${recoveredCount} incomplete sync event(s) back into the queue`);
   }
 
+  tillStatusScheduler = startTillStatusScheduler(models);
+
   app.listen(PORT, () => {
     console.log(`Central sync server running on port ${PORT}`);
   });
@@ -329,6 +333,9 @@ async function shutdown(signal) {
   try {
     if (sageWorker) {
       await sageWorker.close();
+    }
+    if (tillStatusScheduler) {
+      tillStatusScheduler.stop();
     }
     await sageDispatchQueue.close();
     await models.sequelize.close();

@@ -31,7 +31,7 @@ test('day-end order payload ships all quantities and creates the invoice', () =>
   assert.equal(payload.OrderNumber, '001-20260702');
   assert.equal(payload.PostInvoice, true);
   assert.equal(payload.OrderDate, '2026-07-02T12:00:00.000Z');
-  assert.equal(payload.PostingDate, '2026-07-02T12:00:00.000Z');
+  assert.equal(payload.PostingDate, undefined);
   assert.equal(payload.ExpectedShipDate, '2026-07-02T12:00:00.000Z');
   assert.equal(payload.OrderRateDate, '2026-07-02T12:00:00.000Z');
   assert.equal(payload.TRRateDate, '2026-07-02T12:00:00.000Z');
@@ -98,7 +98,7 @@ test('day-end order payload keeps the supplied business date instead of the post
 
   assert.equal(payload.OrderNumber, '001-20260630');
   assert.equal(payload.OrderDate, '2026-06-30T12:00:00.000Z');
-  assert.equal(payload.PostingDate, '2026-06-30T12:00:00.000Z');
+  assert.equal(payload.PostingDate, undefined);
   assert.equal(payload.OrderDescription, '001 T01 2026-06-30');
   assert.equal(payload.OrderFiscalYear, '2026');
   assert.equal(payload.OrderFiscalPeriod, 'Num6');
@@ -126,7 +126,7 @@ test('day-end order payload includes the store revenue account on OE details', (
   assert.equal(payload.DefaultLocationCode, '049S');
   assert.equal(payload.OrderDetails[0].Location, '049S');
   assert.equal(payload.OrderDetails[0].RevenueAccount, '4000-049');
-  assert.equal(payload.PostingDate, '2026-07-14T12:00:00.000Z');
+  assert.equal(payload.PostingDate, undefined);
 });
 
 test('dispatcher resolves day-end date aliases before Sage posting', () => {
@@ -286,4 +286,51 @@ test('422 retry removes detail revenue account if Sage rejects the field', async
   assert.equal(postedOrders[1].OrderDetails[0].RevenueAccount, undefined);
   assert.equal(result.success, true);
   assert.equal(result.retriedWithoutDetailRevenueAccount, true);
+});
+
+test('422 retry does not remove detail revenue account for unrelated order schema errors', async () => {
+  const service = new SageOrdersService();
+  service.getAuthConfig = () => ({ baseUrl: 'http://sage.example', headers: {} });
+  service.findOrderByReference = async () => null;
+  service.findOrderByNumber = async () => null;
+
+  const postedOrders = [];
+  service.postOrder = async (_baseUrl, _headers, order) => {
+    postedOrders.push(order);
+    const error = new Error('Request failed with status code 422');
+    error.response = {
+      status: 422,
+      data: {
+        error: {
+          message: {
+            lang: 'en-US',
+            value: "The property 'PostingDate' does not exist on type 'Sage.CA.SBS.ERP.Sage300.OE.WebApi.Models.Order'.",
+          },
+        },
+      },
+    };
+    throw error;
+  };
+
+  await assert.rejects(() => service.createConsolidatedOrder([
+    {
+      saleReference: 'SALE-RCP-REV',
+      items: [{ product_code: 'ITEM-REV', quantity: 1, unit_price: 25 }],
+      salesData: { total_amount: 25 },
+    },
+  ], {
+    store: {
+      store_number: '049S',
+      store_customer_number: '1049',
+      store_rev_account: '4000-049',
+      currency: 'ZMW',
+      store_tax_group: 'VATZMW',
+    },
+  }, '2026-07-14', 'T01', {
+    branchId: '049',
+    orderReference: 'retry-posting-date-reference',
+  }), /Request failed with status code 422/);
+
+  assert.equal(postedOrders.length, 1);
+  assert.equal(postedOrders[0].OrderDetails[0].RevenueAccount, '4000-049');
 });
