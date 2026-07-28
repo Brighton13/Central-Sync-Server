@@ -38,8 +38,15 @@ test('day-end order payload ships all quantities and creates the invoice', () =>
   assert.equal(payload.OrderFiscalYear, '2026');
   assert.equal(payload.OrderFiscalPeriod, 'Num7');
   assert.equal(payload.OrderOptionalFields, undefined);
+  assert.equal(payload.OrderDetails[0].Category, undefined);
   assert.equal(payload.OrderDetails[0].QuantityOrdered, 2);
   assert.equal(payload.OrderDetails[0].QuantityShipped, 2);
+  assert.equal(payload.PerformShipAll, true);
+  assert.equal(payload.ProcessOECommand, 'ShipAll');
+  assert.equal(payload.ShipmentDate, '2026-07-02T12:00:00.000Z');
+  assert.equal(payload.InvoiceDate, '2026-07-02T12:00:00.000Z');
+  assert.equal(payload.ShipmentPostingDate, '2026-07-02T12:00:00.000Z');
+  assert.equal(payload.InvoicePostingDate, '2026-07-02T12:00:00.000Z');
 });
 
 test('ISAUTOMATIC optional field is opt-in for Sage sites that support it', () => {
@@ -125,6 +132,7 @@ test('day-end order payload does not include the store revenue account on OE det
   assert.equal(payload.CustomerNumber, '1049');
   assert.equal(payload.DefaultLocationCode, '049S');
   assert.equal(payload.OrderDetails[0].Location, '049S');
+  assert.equal(payload.OrderDetails[0].Category, '049');
   assert.equal(payload.OrderDetails[0].RevenueAccount, undefined);
   assert.equal(payload.PostingDate, undefined);
 });
@@ -167,6 +175,28 @@ test('dispatcher resolves day-end date aliases before Sage posting', () => {
   assert.equal(service.resolveDayEndDate({ date: '2026-07-02' }), '2026-07-02');
   assert.equal(service.resolveDayEndDate({ business_date: '2026-07-03' }), '2026-07-03');
   assert.equal(service.resolveDayEndDate({ day_end_date: '2026-07-04' }), '2026-07-04');
+  assert.equal(service.resolveDayEndDate({}, {
+    idempotency_key: 'day_end.ready:store-1:branch-029:date-2026-06-04',
+  }), '2026-06-04');
+});
+
+test('day-end order payload requires an explicit business date', () => {
+  const service = new SageOrdersService();
+
+  assert.throws(() => service.buildConsolidatedOrder([
+    {
+      saleReference: 'SALE-RCP-MISSING-DATE',
+      items: [{ product_code: 'ITEM-1', quantity: 1, unit_price: 10 }],
+      salesData: { total_amount: 10 },
+    },
+  ], {
+    store: {
+      store_number: 'MAIN',
+      store_customer_number: '1101',
+      currency: 'ZMW',
+      store_tax_group: 'VATZMW',
+    },
+  }, null, 'T01', 'day-end-key', { branchId: '001' }), /valid day-end date/);
 });
 
 test('day-end order posting reuses an existing Sage order with the same order number', async () => {

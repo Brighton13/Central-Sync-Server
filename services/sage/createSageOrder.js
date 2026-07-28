@@ -26,6 +26,10 @@ class SageOrdersService {
 
   resolveBusinessDateKey(date) {
     const raw = String(date || '').trim();
+    if (!raw) {
+      throw new Error('A valid day-end date is required for Sage posting');
+    }
+
     const directDateMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
     if (directDateMatch) {
       return `${directDateMatch[1]}-${directDateMatch[2]}-${directDateMatch[3]}`;
@@ -100,6 +104,20 @@ class SageOrdersService {
     return value || null;
   }
 
+  resolveStoreCategory(user) {
+    const explicitCategory = String(
+      user?.store?.sage_category_code
+      || user?.store?.store_category_code
+      || ''
+    ).trim();
+    if (explicitCategory) {
+      return explicitCategory;
+    }
+
+    const storeDigits = String(user?.store?.store_number || '').match(/\d+/)?.[0] || '';
+    return storeDigits || null;
+  }
+
   normalizeItem(item) {
     const quantity = Number(item.quantity || 0);
     const unitPrice = Number(item.unit_price || 0);
@@ -125,6 +143,7 @@ class SageOrdersService {
     const storeRevenueAccount = this.shouldIncludeDetailRevenueAccount()
       ? this.resolveStoreRevenueAccount(user)
       : null;
+    const storeCategory = this.resolveStoreCategory(user);
     let detailIndex = 0;
     const orderDetails = [];
 
@@ -158,6 +177,10 @@ class SageOrdersService {
 
         if (storeRevenueAccount) {
           orderDetail.RevenueAccount = storeRevenueAccount;
+        }
+
+        if (storeCategory) {
+          orderDetail.Category = storeCategory;
         }
 
         orderDetails.push(orderDetail);
@@ -204,6 +227,12 @@ class SageOrdersService {
       // Shipping every detail and enabling PostInvoice makes Sage post the shipment and
       // create the corresponding O/E invoice as part of posting this order.
       PostInvoice: true,
+      PerformShipAll: true,
+      ProcessOECommand: 'ShipAll',
+      ShipmentDate: orderDate,
+      InvoiceDate: orderDate,
+      ShipmentPostingDate: orderDate,
+      InvoicePostingDate: orderDate,
       TaxReportingTRCurrency: user?.store?.currency || 'ZMW',
       TRRateType: 'SP',
       TRRateDate: orderDate,

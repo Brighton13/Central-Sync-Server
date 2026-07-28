@@ -34,8 +34,17 @@ class EventDispatchService {
     ).trim() || '000';
   }
 
-  resolveDayEndDate(payload) {
-    return payload?.date || payload?.business_date || payload?.day_end_date || null;
+  resolveDateFromIdempotencyKey(idempotencyKey) {
+    const match = String(idempotencyKey || '').match(/(?:^|:)date-(\d{4}-\d{2}-\d{2})(?:$|:)/);
+    return match ? match[1] : null;
+  }
+
+  resolveDayEndDate(payload, syncEvent = null) {
+    return payload?.date
+      || payload?.business_date
+      || payload?.day_end_date
+      || this.resolveDateFromIdempotencyKey(syncEvent?.idempotency_key)
+      || null;
   }
 
   buildSalesDataArray(sales) {
@@ -179,7 +188,7 @@ class EventDispatchService {
       const user = pendingCreditNotes[0]?.cashier || null;
       const branchId = this.resolveBranchId(payload, user);
       const terminalId = this.resolveTerminalId(payload, user);
-      const dayEndDate = this.resolveDayEndDate(payload);
+      const dayEndDate = this.resolveDayEndDate(payload, syncEvent);
       const result = await this.sageCreditNoteService.createConsolidatedCreditNoteReturn(
         pendingCreditNotes,
         user,
@@ -236,7 +245,7 @@ class EventDispatchService {
       const user = this.buildUserContextFromSales(pendingSales);
       const branchId = this.resolveBranchId(payload, user);
       const terminalId = this.resolveTerminalId(payload, user);
-      const dayEndDate = this.resolveDayEndDate(payload);
+      const dayEndDate = this.resolveDayEndDate(payload, syncEvent);
       const result = await this.sageOrdersService.createConsolidatedOrder(
         salesDataArray,
         user,
