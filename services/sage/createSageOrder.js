@@ -92,7 +92,7 @@ class SageOrdersService {
   }
 
   shouldIncludeDetailRevenueAccount() {
-    return String(process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT || 'true').toLowerCase() !== 'false';
+    return String(process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT || 'false').toLowerCase() === 'true';
   }
 
   resolveStoreRevenueAccount(user) {
@@ -270,7 +270,7 @@ class SageOrdersService {
 
   shouldRetryWithoutDetailRevenueAccount(error, order) {
     const sageMessage = this.extractSageErrorMessage(error?.response?.data || null);
-    return error?.response?.status === 422
+    return [400, 422].includes(error?.response?.status)
       && this.hasDetailRevenueAccount(order)
       && /RevenueAccount/i.test(sageMessage)
       && String(process.env.SAGE_RETRY_WITHOUT_OE_DETAIL_REVENUE_ACCOUNT_ON_422 || 'true').toLowerCase() !== 'false';

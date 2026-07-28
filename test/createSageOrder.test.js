@@ -104,7 +104,7 @@ test('day-end order payload keeps the supplied business date instead of the post
   assert.equal(payload.OrderFiscalPeriod, 'Num6');
 });
 
-test('day-end order payload includes the store revenue account on OE details', () => {
+test('day-end order payload does not include the store revenue account on OE details by default', () => {
   const service = new SageOrdersService();
   const payload = service.buildConsolidatedOrder([
     {
@@ -125,8 +125,40 @@ test('day-end order payload includes the store revenue account on OE details', (
   assert.equal(payload.CustomerNumber, '1049');
   assert.equal(payload.DefaultLocationCode, '049S');
   assert.equal(payload.OrderDetails[0].Location, '049S');
-  assert.equal(payload.OrderDetails[0].RevenueAccount, '4000-049');
+  assert.equal(payload.OrderDetails[0].RevenueAccount, undefined);
   assert.equal(payload.PostingDate, undefined);
+});
+
+test('day-end order payload includes the store revenue account on OE details when opted in', () => {
+  const original = process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT;
+  process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT = 'true';
+
+  try {
+    const service = new SageOrdersService();
+    const payload = service.buildConsolidatedOrder([
+      {
+        saleReference: 'SALE-RCP-REV',
+        items: [{ product_code: 'ITEM-REV', quantity: 1, unit_price: 25 }],
+        salesData: { total_amount: 25 },
+      },
+    ], {
+      store: {
+        store_number: '049S',
+        store_customer_number: '1049',
+        store_rev_account: '4000-049',
+        currency: 'ZMW',
+        store_tax_group: 'VATZMW',
+      },
+    }, '2026-07-14', 'T01', 'day-end-key', { branchId: '049' });
+
+    assert.equal(payload.OrderDetails[0].RevenueAccount, '4000-049');
+  } finally {
+    if (original === undefined) {
+      delete process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT;
+    } else {
+      process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT = original;
+    }
+  }
 });
 
 test('dispatcher resolves day-end date aliases before Sage posting', () => {
@@ -234,7 +266,9 @@ test('422 retry removes malformed optional fields before reposting', async () =>
   assert.equal(result.retriedWithoutAutomaticOptionalField, true);
 });
 
-test('422 retry removes detail revenue account if Sage rejects the field', async () => {
+test('400/422 retry removes detail revenue account if Sage rejects the field', async () => {
+  const original = process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT;
+  process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT = 'true';
   const service = new SageOrdersService();
   service.getAuthConfig = () => ({ baseUrl: 'http://sage.example', headers: {} });
   service.findOrderByReference = async () => null;
@@ -246,8 +280,16 @@ test('422 retry removes detail revenue account if Sage rejects the field', async
     if (postedOrders.length === 1) {
       const error = new Error('Request failed with status code 422');
       error.response = {
-        status: 422,
-        data: { error: { message: { OrderDetails: ['RevenueAccount is not editable'] } } },
+        status: 400,
+        data: {
+          error: {
+            code: 'InvalidPayload',
+            message: {
+              lang: 'en-US',
+              value: "The property 'RevenueAccount' does not exist on type 'Sage.CA.SBS.ERP.Sage300.OE.WebApi.Models.OrderDetail'.",
+            },
+          },
+        },
       };
       throw error;
     }
@@ -262,33 +304,43 @@ test('422 retry removes detail revenue account if Sage rejects the field', async
     };
   };
 
-  const result = await service.createConsolidatedOrder([
-    {
-      saleReference: 'SALE-RCP-REV',
-      items: [{ product_code: 'ITEM-REV', quantity: 1, unit_price: 25 }],
-      salesData: { total_amount: 25 },
-    },
-  ], {
-    store: {
-      store_number: '049S',
-      store_customer_number: '1049',
-      store_rev_account: '4000-049',
-      currency: 'ZMW',
-      store_tax_group: 'VATZMW',
-    },
-  }, '2026-07-14', 'T01', {
-    branchId: '049',
-    orderReference: 'retry-revenue-reference',
-  });
+  try {
+    const result = await service.createConsolidatedOrder([
+      {
+        saleReference: 'SALE-RCP-REV',
+        items: [{ product_code: 'ITEM-REV', quantity: 1, unit_price: 25 }],
+        salesData: { total_amount: 25 },
+      },
+    ], {
+      store: {
+        store_number: '049S',
+        store_customer_number: '1049',
+        store_rev_account: '4000-049',
+        currency: 'ZMW',
+        store_tax_group: 'VATZMW',
+      },
+    }, '2026-07-14', 'T01', {
+      branchId: '049',
+      orderReference: 'retry-revenue-reference',
+    });
 
-  assert.equal(postedOrders.length, 2);
-  assert.equal(postedOrders[0].OrderDetails[0].RevenueAccount, '4000-049');
-  assert.equal(postedOrders[1].OrderDetails[0].RevenueAccount, undefined);
-  assert.equal(result.success, true);
-  assert.equal(result.retriedWithoutDetailRevenueAccount, true);
+    assert.equal(postedOrders.length, 2);
+    assert.equal(postedOrders[0].OrderDetails[0].RevenueAccount, '4000-049');
+    assert.equal(postedOrders[1].OrderDetails[0].RevenueAccount, undefined);
+    assert.equal(result.success, true);
+    assert.equal(result.retriedWithoutDetailRevenueAccount, true);
+  } finally {
+    if (original === undefined) {
+      delete process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT;
+    } else {
+      process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT = original;
+    }
+  }
 });
 
 test('422 retry does not remove detail revenue account for unrelated order schema errors', async () => {
+  const original = process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT;
+  process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT = 'true';
   const service = new SageOrdersService();
   service.getAuthConfig = () => ({ baseUrl: 'http://sage.example', headers: {} });
   service.findOrderByReference = async () => null;
@@ -312,25 +364,33 @@ test('422 retry does not remove detail revenue account for unrelated order schem
     throw error;
   };
 
-  await assert.rejects(() => service.createConsolidatedOrder([
-    {
-      saleReference: 'SALE-RCP-REV',
-      items: [{ product_code: 'ITEM-REV', quantity: 1, unit_price: 25 }],
-      salesData: { total_amount: 25 },
-    },
-  ], {
-    store: {
-      store_number: '049S',
-      store_customer_number: '1049',
-      store_rev_account: '4000-049',
-      currency: 'ZMW',
-      store_tax_group: 'VATZMW',
-    },
-  }, '2026-07-14', 'T01', {
-    branchId: '049',
-    orderReference: 'retry-posting-date-reference',
-  }), /Request failed with status code 422/);
+  try {
+    await assert.rejects(() => service.createConsolidatedOrder([
+      {
+        saleReference: 'SALE-RCP-REV',
+        items: [{ product_code: 'ITEM-REV', quantity: 1, unit_price: 25 }],
+        salesData: { total_amount: 25 },
+      },
+    ], {
+      store: {
+        store_number: '049S',
+        store_customer_number: '1049',
+        store_rev_account: '4000-049',
+        currency: 'ZMW',
+        store_tax_group: 'VATZMW',
+      },
+    }, '2026-07-14', 'T01', {
+      branchId: '049',
+      orderReference: 'retry-posting-date-reference',
+    }), /Request failed with status code 422/);
 
-  assert.equal(postedOrders.length, 1);
-  assert.equal(postedOrders[0].OrderDetails[0].RevenueAccount, '4000-049');
+    assert.equal(postedOrders.length, 1);
+    assert.equal(postedOrders[0].OrderDetails[0].RevenueAccount, '4000-049');
+  } finally {
+    if (original === undefined) {
+      delete process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT;
+    } else {
+      process.env.SAGE_INCLUDE_OE_DETAIL_REVENUE_ACCOUNT = original;
+    }
+  }
 });
