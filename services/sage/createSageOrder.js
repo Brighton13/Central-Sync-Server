@@ -378,8 +378,13 @@ class SageOrdersService {
     }
   }
 
+  sanitizeOrderPayload(order) {
+    const { PostingDate, ...sanitizedOrder } = order || {};
+    return sanitizedOrder;
+  }
+
   async postOrder(baseUrl, headers, order) {
-    return axios.post(`${baseUrl}/OE/OEOrders`, order, {
+    return axios.post(`${baseUrl}/OE/OEOrders`, this.sanitizeOrderPayload(order), {
       headers,
       timeout: this.timeout,
     });

@@ -424,3 +424,29 @@ test('422 retry does not remove detail revenue account for unrelated order schem
     }
   }
 });
+
+test('postOrder strips unsupported OE order header PostingDate before sending to Sage', async () => {
+  const service = new SageOrdersService();
+  let postedOrder = null;
+
+  const originalPost = require('axios').post;
+  require('axios').post = async (_url, order) => {
+    postedOrder = order;
+    return { status: 201, data: { OrderNumber: order.OrderNumber } };
+  };
+
+  try {
+    await service.postOrder('http://sage.example', {}, {
+      OrderNumber: '001-20260728',
+      PostingDate: '2026-07-28T12:00:00.000Z',
+      ShipmentPostingDate: '2026-07-28T12:00:00.000Z',
+      InvoicePostingDate: '2026-07-28T12:00:00.000Z',
+    });
+
+    assert.equal(postedOrder.PostingDate, undefined);
+    assert.equal(postedOrder.ShipmentPostingDate, '2026-07-28T12:00:00.000Z');
+    assert.equal(postedOrder.InvoicePostingDate, '2026-07-28T12:00:00.000Z');
+  } finally {
+    require('axios').post = originalPost;
+  }
+});
