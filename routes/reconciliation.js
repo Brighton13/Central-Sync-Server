@@ -247,6 +247,62 @@ function serializeSyncEvent(syncEvent) {
   };
 }
 
+function extractReadableMessage(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    try {
+      return extractReadableMessage(JSON.parse(trimmed)) || trimmed;
+    } catch {
+      return trimmed;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(extractReadableMessage).filter(Boolean).join('; ') || null;
+  }
+
+  if (typeof value === 'object') {
+    return extractReadableMessage(
+      value.sageMessage
+      || value.message?.value
+      || value.error?.message?.value
+      || value.error?.message
+      || value.message
+      || value.value
+    );
+  }
+
+  return String(value);
+}
+
+function normalizeBatchFailureReason(syncEvent) {
+  const message = extractReadableMessage(syncEvent?.last_error);
+  if (message) {
+    return message.replace(/\s+/g, ' ').trim();
+  }
+
+  switch (syncEvent?.status) {
+    case 'failed':
+    case 'dead_letter':
+      return 'The batch failed before it could be posted to Sage. Try posting it again to capture the current Sage response.';
+    case 'queued':
+    case 'received':
+      return 'The batch is queued and has not posted to Sage yet.';
+    case 'processing':
+      return 'The batch is currently being posted to Sage.';
+    default:
+      return null;
+  }
+}
+
 function getSales(syncEvent) {
   const payload = getPayload(syncEvent);
   return Array.isArray(payload.sales) ? payload.sales : [];
@@ -497,6 +553,7 @@ function buildBatchRow(syncEvent) {
     idempotencyKey: syncEvent.idempotency_key,
     sageReferences: references.slice(0, 3),
     lastError: syncEvent.last_error,
+    failureReason: normalizeBatchFailureReason(syncEvent),
   };
 }
 
@@ -1000,6 +1057,8 @@ router.get('/summary', reconAuth, async (req, res) => {
       idempotencyKey: syncEvent.idempotency_key,
       sageReferences: references.slice(0, 3),
       lastError: syncEvent.last_error,
+      failureReason: normalizeBatchFailureReason(syncEvent),
+      canTryPost: batch.event_type === SALES_EVENT_TYPE && syncEvent.status !== 'completed',
     };
   });
 
@@ -2585,15 +2644,40 @@ router.post('/batches/:id/reconcile', reconAuth, requireReconRole('admin'), asyn
     const dispatchService = new EventDispatchService(models);
     const result = await dispatchService.reconcileDayEndExports(syncEvent, options);
 
+    if (options.repost) {
+      await syncEvent.update({
+        status: result.success === false ? 'failed' : 'completed',
+        processed_at: result.success === false ? syncEvent.processed_at : new Date(),
+        last_attempt_at: new Date(),
+        last_error: result.success === false ? (result.message || 'Failed to repost batch to Sage.') : null,
+        response_payload: result,
+      });
+    }
+
     return res.status(result.success ? 200 : 422).json({
       ...result,
       eventId: syncEvent.id,
-      event: serializeSyncEvent(syncEvent),
+      event: serializeSyncEvent(await models.syncEvent.findByPk(syncEvent.id)),
     });
   } catch (error) {
+    const sageErrorPayload = error.sageErrorPayload || error.response?.data || { message: error.message };
+    const readableMessage = extractReadableMessage(sageErrorPayload)
+      || error.message
+      || 'Failed to reconcile batch with Sage.';
+
+    await syncEvent.update({
+      status: 'failed',
+      retry_count: (syncEvent.retry_count || 0) + 1,
+      last_error: readableMessage,
+      response_payload: sageErrorPayload,
+      last_attempt_at: new Date(),
+    });
+
     return res.status(500).json({
       success: false,
-      message: error.message || 'Failed to reconcile batch with Sage.',
+      message: readableMessage,
+      eventId: syncEvent.id,
+      event: serializeSyncEvent(await models.syncEvent.findByPk(syncEvent.id)),
     });
   }
 });

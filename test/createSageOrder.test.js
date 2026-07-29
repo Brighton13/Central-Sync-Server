@@ -237,6 +237,113 @@ test('day-end order posting reuses an existing Sage order with the same order nu
   assert.equal(result.orderReference, 'existing-reference');
 });
 
+test('409 duplicate from Sage is reconciled to the existing order and returned as success', async () => {
+  const service = new SageOrdersService();
+  service.getAuthConfig = () => ({ baseUrl: 'http://sage.example', headers: {} });
+  let referenceLookupCount = 0;
+  service.findOrderByReference = async (orderReference) => {
+    referenceLookupCount += 1;
+    if (referenceLookupCount === 1) {
+      return null;
+    }
+
+    return {
+      OrderNumber: '001-20260705',
+      OrderUniquifier: 987,
+      OrderReference: orderReference,
+    };
+  };
+  let orderNumberLookupCount = 0;
+  service.findOrderByNumber = async () => {
+    orderNumberLookupCount += 1;
+    return null;
+  };
+  service.postOrder = async () => {
+    const error = new Error('Request failed with status code 409');
+    error.response = {
+      status: 409,
+      data: {
+        error: {
+          code: 'RecordDuplicate',
+          message: { value: 'Order. Record already exists.' },
+        },
+      },
+    };
+    throw error;
+  };
+
+  const result = await service.createConsolidatedOrder([
+    {
+      saleReference: 'SALE-RCP-DUP',
+      items: [{ product_code: 'ITEM-DUP', quantity: 1, unit_price: 12 }],
+      salesData: { total_amount: 12 },
+    },
+  ], {
+    store: {
+      store_number: 'MAIN',
+      store_customer_number: '1101',
+      currency: 'ZMW',
+      store_tax_group: 'VATZMW',
+    },
+  }, '2026-07-05', 'T01', {
+    branchId: '001',
+    orderReference: 'duplicate-reference',
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.existingOrder, true);
+  assert.equal(result.existingOrderMatchedBy, 'OrderReference');
+  assert.equal(result.duplicateRecovered, true);
+  assert.equal(result.orderNumber, '001-20260705');
+  assert.equal(result.orderUniquifier, '987');
+  assert.equal(result.orderReference, 'duplicate-reference');
+  assert.equal(orderNumberLookupCount, 1);
+});
+
+test('409 duplicate from Sage fails with lookup context when no existing order is found', async () => {
+  const service = new SageOrdersService();
+  service.getAuthConfig = () => ({ baseUrl: 'http://sage.example', headers: {} });
+  service.findOrderByReference = async () => null;
+  service.findOrderByNumber = async () => null;
+  service.postOrder = async () => {
+    const error = new Error('Request failed with status code 409');
+    error.response = {
+      status: 409,
+      data: {
+        error: {
+          code: 'RecordDuplicate',
+          message: { value: 'Order. Record already exists.' },
+        },
+      },
+    };
+    throw error;
+  };
+
+  await assert.rejects(async () => {
+    await service.createConsolidatedOrder([
+      {
+        saleReference: 'SALE-RCP-DUP-MISSING',
+        items: [{ product_code: 'ITEM-DUP', quantity: 1, unit_price: 12 }],
+        salesData: { total_amount: 12 },
+      },
+    ], {
+      store: {
+        store_number: 'MAIN',
+        store_customer_number: '1101',
+        currency: 'ZMW',
+        store_tax_group: 'VATZMW',
+      },
+    }, '2026-07-05', 'T01', {
+      branchId: '001',
+      orderReference: 'duplicate-missing-reference',
+    });
+  }, (error) => {
+    assert.equal(error.sageErrorPayload?.duplicateLookupFailed, true);
+    assert.equal(error.sageErrorPayload?.status, 409);
+    return true;
+  });
+});
+
 test('422 retry removes malformed optional fields before reposting', async () => {
   const service = new SageOrdersService();
   service.getAuthConfig = () => ({ baseUrl: 'http://sage.example', headers: {} });

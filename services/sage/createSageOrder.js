@@ -305,6 +305,15 @@ class SageOrdersService {
       && String(process.env.SAGE_RETRY_WITHOUT_OE_DETAIL_REVENUE_ACCOUNT_ON_422 || 'true').toLowerCase() !== 'false';
   }
 
+  isDuplicateOrderError(error) {
+    const sageResponse = error?.response?.data || null;
+    const sageMessage = this.extractSageErrorMessage(sageResponse) || '';
+    const sageCode = String(sageResponse?.error?.code || sageResponse?.code || '');
+
+    return error?.response?.status === 409
+      && /RecordDuplicate|duplicate|already exists/i.test(`${sageCode} ${sageMessage}`);
+  }
+
   withoutAutomaticOptionalField(order) {
     const fallbackOrder = {
       ...order,
@@ -406,6 +415,7 @@ class SageOrdersService {
       orderReference: orderData?.OrderReference || options.orderReference || '',
       existingOrder: Boolean(options.existingOrder),
       existingOrderMatchedBy: options.existingOrderMatchedBy || null,
+      duplicateRecovered: Boolean(options.duplicateRecovered),
       retriedWithoutAutomaticOptionalField: Boolean(options.optionalFieldRetry),
       retriedWithoutDetailRevenueAccount: Boolean(options.revenueAccountRetry),
     };
@@ -471,6 +481,52 @@ class SageOrdersService {
     return this.extractOrderEntity(response.data);
   }
 
+  async findExistingOrderForDuplicate(order, options = {}) {
+    const lookupErrors = [];
+
+    if (options.orderReference) {
+      try {
+        const existingOrderByReference = await this.findOrderByReference(options.orderReference);
+        if (existingOrderByReference?.OrderNumber) {
+          return {
+            order: existingOrderByReference,
+            matchedBy: 'OrderReference',
+            lookupErrors,
+          };
+        }
+      } catch (error) {
+        lookupErrors.push({
+          matchedBy: 'OrderReference',
+          message: error.message,
+          status: error.response?.status || null,
+        });
+      }
+    }
+
+    try {
+      const existingOrderByNumber = await this.findOrderByNumber(order.OrderNumber);
+      if (existingOrderByNumber?.OrderNumber) {
+        return {
+          order: existingOrderByNumber,
+          matchedBy: 'OrderNumber',
+          lookupErrors,
+        };
+      }
+    } catch (error) {
+      lookupErrors.push({
+        matchedBy: 'OrderNumber',
+        message: error.message,
+        status: error.response?.status || null,
+      });
+    }
+
+    return {
+      order: null,
+      matchedBy: null,
+      lookupErrors,
+    };
+  }
+
   async createConsolidatedOrder(salesDataArray, user, date, terminalId, options = {}) {
     const { baseUrl, headers } = this.getAuthConfig();
     const order = this.buildConsolidatedOrder(salesDataArray, user, date, terminalId, options.orderReference, options);
@@ -501,6 +557,34 @@ class SageOrdersService {
     try {
       response = await this.postOrder(baseUrl, headers, order);
     } catch (error) {
+      if (this.isDuplicateOrderError(error)) {
+        const duplicateLookup = await this.findExistingOrderForDuplicate(order, options);
+
+        if (duplicateLookup.order) {
+          console.warn('[SageOrdersService] Sage reported duplicate OE order; linking to existing Sage order.', this.formatForLog({
+            status: error.response?.status,
+            sageMessage: this.extractSageErrorMessage(error.response?.data || null),
+            matchedBy: duplicateLookup.matchedBy,
+            orderNumber: duplicateLookup.order.OrderNumber,
+            orderUniquifier: duplicateLookup.order.OrderUniquifier,
+            orderReference: duplicateLookup.order.OrderReference,
+            request: this.summarizeOrderForError(order),
+          }));
+
+          return this.normalizeOrderResponse(duplicateLookup.order, 200, salesDataArray, order, terminalId, {
+            orderReference: options.orderReference,
+            existingOrder: true,
+            existingOrderMatchedBy: duplicateLookup.matchedBy,
+            duplicateRecovered: true,
+          });
+        }
+
+        throw this.enrichSagePostError(error, order, {
+          duplicateLookupFailed: true,
+          duplicateLookupErrors: duplicateLookup.lookupErrors,
+        });
+      }
+
       if (this.shouldRetryWithoutDetailRevenueAccount(error, order)) {
         revenueAccountRetry = true;
         const fallbackOrder = this.withoutDetailRevenueAccount(order);
