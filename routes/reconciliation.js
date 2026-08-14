@@ -1036,6 +1036,9 @@ router.get('/summary', reconAuth, async (req, res) => {
     const syncEvent = projectionEvent(batch);
     const eventExports = exportsByEvent.get(batch.sync_event_id) || [];
     const references = Array.from(new Set(eventExports.map((row) => row.sage_reference).filter(Boolean)));
+    const pendingSalesCount = batch.event_type === SALES_EVENT_TYPE
+      ? Math.max(Number(batch.transaction_count || 0) - eventExports.filter((row) => row.document_type === 'oe_order').length, 0)
+      : 0;
     return {
       id: batch.sync_event_id,
       eventType: batch.event_type,
@@ -1058,7 +1061,8 @@ router.get('/summary', reconAuth, async (req, res) => {
       sageReferences: references.slice(0, 3),
       lastError: syncEvent.last_error,
       failureReason: normalizeBatchFailureReason(syncEvent),
-      canTryPost: batch.event_type === SALES_EVENT_TYPE && syncEvent.status !== 'completed',
+      pendingSalesCount,
+      canTryPost: pendingSalesCount > 0,
     };
   });
 
@@ -2541,7 +2545,11 @@ router.get('/batches', reconAuth, async (req, res) => {
   const rows = plainBatches.map((batch) => {
     const syncEvent = projectionEvent(batch);
     const eventExports = exportsByEvent.get(batch.sync_event_id) || [];
+    const orderExportCount = eventExports.filter((row) => row.document_type === 'oe_order').length;
     const references = Array.from(new Set(eventExports.map((row) => row.sage_reference).filter(Boolean)));
+    const pendingSalesCount = batch.event_type === SALES_EVENT_TYPE
+      ? Math.max(Number(batch.transaction_count || 0) - orderExportCount, 0)
+      : 0;
     return {
       id: batch.sync_event_id,
       eventType: batch.event_type,
@@ -2556,6 +2564,8 @@ router.get('/batches', reconAuth, async (req, res) => {
       creditNoteCount: batch.credit_note_count,
       creditNoteTotal: roundCurrency(batch.credit_note_total),
       exportedCount: eventExports.length,
+      pendingSalesCount,
+      canTryPost: pendingSalesCount > 0,
       batchDate: batch.batch_date,
       receivedAt: batch.received_at,
       processedAt: syncEvent.processed_at,
