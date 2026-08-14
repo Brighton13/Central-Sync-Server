@@ -1075,6 +1075,7 @@ router.get('/summary', reconAuth, async (req, res) => {
     const pendingSalesCount = batch.event_type === SALES_EVENT_TYPE
       ? (pendingSalesByEvent.get(batch.sync_event_id) || 0)
       : 0;
+    const missingOeOrder = batch.event_type === SALES_EVENT_TYPE && pendingSalesCount > 0;
     return {
       id: batch.sync_event_id,
       eventType: batch.event_type,
@@ -1098,7 +1099,9 @@ router.get('/summary', reconAuth, async (req, res) => {
       lastError: syncEvent.last_error,
       failureReason: normalizeBatchFailureReason(syncEvent),
       pendingSalesCount,
-      canTryPost: pendingSalesCount > 0,
+      missingOeOrder,
+      attentionReason: missingOeOrder ? 'Completed locally but missing Sage OE order' : normalizeBatchFailureReason(syncEvent),
+      canTryPost: missingOeOrder,
     };
   });
 
@@ -2586,6 +2589,7 @@ router.get('/batches', reconAuth, async (req, res) => {
     const pendingSalesCount = batch.event_type === SALES_EVENT_TYPE
       ? Math.max(Number(batch.transaction_count || 0) - orderExportCount, 0)
       : 0;
+    const missingOeOrder = batch.event_type === SALES_EVENT_TYPE && pendingSalesCount > 0;
     return {
       id: batch.sync_event_id,
       eventType: batch.event_type,
@@ -2601,7 +2605,9 @@ router.get('/batches', reconAuth, async (req, res) => {
       creditNoteTotal: roundCurrency(batch.credit_note_total),
       exportedCount: eventExports.length,
       pendingSalesCount,
-      canTryPost: pendingSalesCount > 0,
+      missingOeOrder,
+      attentionReason: missingOeOrder ? 'Completed locally but missing Sage OE order' : normalizeBatchFailureReason(syncEvent),
+      canTryPost: missingOeOrder,
       batchDate: batch.batch_date,
       receivedAt: batch.received_at,
       processedAt: syncEvent.processed_at,
