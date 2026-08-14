@@ -382,6 +382,30 @@ function toStatusBucket(status) {
   return STATUS_BUCKETS[status] || 'pending';
 }
 
+function hasMissingOeOrder(syncEvent, pendingSalesCount) {
+  return syncEvent.event_type === SALES_EVENT_TYPE
+    && syncEvent.status === 'completed'
+    && Number(pendingSalesCount || 0) > 0;
+}
+
+function reportingBatchStatus(syncEvent, pendingSalesCount = 0) {
+  if (hasMissingOeOrder(syncEvent, pendingSalesCount)) {
+    return {
+      status: 'missing_oe_order',
+      statusBucket: 'pending',
+      missingOeOrder: true,
+      attentionReason: 'Completed locally but missing Sage OE order',
+    };
+  }
+
+  return {
+    status: syncEvent.status,
+    statusBucket: toStatusBucket(syncEvent.status),
+    missingOeOrder: false,
+    attentionReason: normalizeBatchFailureReason(syncEvent),
+  };
+}
+
 function incrementDocumentCounter(target, documentType, count = 1) {
   if (!target[documentType]) {
     target[documentType] = 0;
@@ -400,6 +424,7 @@ function upsertPerformanceBucket(collection, key, label) {
       batches: 0,
       completedBatches: 0,
       pendingBatches: 0,
+      missingOeBatches: 0,
       failedBatches: 0,
       salesCount: 0,
       postedSalesCount: 0,
@@ -586,6 +611,7 @@ function buildSaleRow(syncEvent, sale, saleExportRows) {
   const documents = {
     oe_order: saleExportRows.find((row) => row.document_type === 'oe_order') || null,
   };
+  const status = reportingBatchStatus(syncEvent, documents.oe_order ? 0 : 1);
 
   return {
     id: `${syncEvent.id}:${sale.id}`,
@@ -599,8 +625,10 @@ function buildSaleRow(syncEvent, sale, saleExportRows) {
     batchReceivedAt: syncEvent.received_at,
     amount: roundCurrency(sale.total_amount),
     paymentMethod: sale.payment_method || null,
-    batchStatus: syncEvent.status,
-    batchStatusBucket: toStatusBucket(syncEvent.status),
+    batchStatus: status.status,
+    batchStatusBucket: status.statusBucket,
+    batchLocalStatus: syncEvent.status,
+    missingOeOrder: status.missingOeOrder,
     oeOrderNumber: documents.oe_order?.sage_document_number || null,
     sageReference: documents.oe_order?.sage_reference || null,
     documentsPosted: saleExportRows.length,
@@ -1017,13 +1045,16 @@ router.get('/summary', reconAuth, async (req, res) => {
   const documentSummary = {};
   let completedBatches = 0;
   let pendingBatches = 0;
+  let missingOeBatches = 0;
   let failedBatches = 0;
 
   for (const batch of batches) {
     const syncEvent = projectionEvent(batch);
-    const bucket = toStatusBucket(syncEvent.status);
-    if (bucket === 'completed') completedBatches += 1;
-    else if (bucket === 'failed') failedBatches += 1;
+    const pendingSalesCount = pendingSalesByEvent.get(batch.sync_event_id) || 0;
+    const status = reportingBatchStatus(syncEvent, pendingSalesCount);
+    if (status.missingOeOrder) missingOeBatches += 1;
+    else if (status.statusBucket === 'completed') completedBatches += 1;
+    else if (status.statusBucket === 'failed') failedBatches += 1;
     else pendingBatches += 1;
     incrementDocumentCounter(documentSummary, batch.event_type, Number(batch.transaction_count || 0));
 
@@ -1036,10 +1067,15 @@ router.get('/summary', reconAuth, async (req, res) => {
     terminal.terminalId = String(terminalId);
     branch.batches += 1;
     terminal.batches += 1;
-    if (bucket === 'completed') {
+    if (status.missingOeOrder) {
+      branch.pendingBatches += 1;
+      terminal.pendingBatches += 1;
+      branch.missingOeBatches = (branch.missingOeBatches || 0) + 1;
+      terminal.missingOeBatches = (terminal.missingOeBatches || 0) + 1;
+    } else if (status.statusBucket === 'completed') {
       branch.completedBatches += 1;
       terminal.completedBatches += 1;
-    } else if (bucket === 'failed') {
+    } else if (status.statusBucket === 'failed') {
       branch.failedBatches += 1;
       terminal.failedBatches += 1;
     } else {
@@ -1075,13 +1111,14 @@ router.get('/summary', reconAuth, async (req, res) => {
     const pendingSalesCount = batch.event_type === SALES_EVENT_TYPE
       ? (pendingSalesByEvent.get(batch.sync_event_id) || 0)
       : 0;
-    const missingOeOrder = batch.event_type === SALES_EVENT_TYPE && pendingSalesCount > 0;
+    const status = reportingBatchStatus(syncEvent, pendingSalesCount);
     return {
       id: batch.sync_event_id,
       eventType: batch.event_type,
       label: EVENT_TYPE_LABELS[batch.event_type] || batch.event_type,
-      status: syncEvent.status,
-      statusBucket: toStatusBucket(syncEvent.status),
+      status: status.status,
+      statusBucket: status.statusBucket,
+      localStatus: syncEvent.status,
       storeId: batch.store_id,
       branchId: batch.branch_id || 'Unassigned',
       terminalId: batch.terminal_id || 'Unassigned',
@@ -1099,9 +1136,9 @@ router.get('/summary', reconAuth, async (req, res) => {
       lastError: syncEvent.last_error,
       failureReason: normalizeBatchFailureReason(syncEvent),
       pendingSalesCount,
-      missingOeOrder,
-      attentionReason: missingOeOrder ? 'Completed locally but missing Sage OE order' : normalizeBatchFailureReason(syncEvent),
-      canTryPost: missingOeOrder,
+      missingOeOrder: status.missingOeOrder,
+      attentionReason: status.attentionReason,
+      canTryPost: status.missingOeOrder,
     };
   });
 
@@ -1120,6 +1157,7 @@ router.get('/summary', reconAuth, async (req, res) => {
       totalBatches: batches.length,
       completedBatches,
       pendingBatches,
+      missingOeBatches,
       failedBatches,
       totalSalesCount,
       postedSalesCount,
@@ -2357,7 +2395,7 @@ function projectionEvent(row) {
 }
 
 const PROJECTION_EVENT_ATTRIBUTES = [
-  'id', 'status', 'received_at', 'processed_at', 'last_attempt_at',
+  'id', 'event_type', 'status', 'received_at', 'processed_at', 'last_attempt_at',
   'retry_count', 'idempotency_key', 'last_error',
 ];
 
@@ -2399,6 +2437,7 @@ router.get('/sales', reconAuth, async (req, res) => {
     const syncEvent = projectionEvent(sale);
     const document = exportLookup.get(sale.identity_key) || null;
     const documents = { oe_order: document };
+    const status = reportingBatchStatus(syncEvent, document ? 0 : 1);
     return {
       id: `${sale.sync_event_id}:${sale.sale_id}`,
       syncEventId: sale.sync_event_id,
@@ -2411,8 +2450,10 @@ router.get('/sales', reconAuth, async (req, res) => {
       batchReceivedAt: syncEvent.received_at,
       amount: roundCurrency(sale.total_amount),
       paymentMethod: sale.payment_method || null,
-      batchStatus: syncEvent.status,
-      batchStatusBucket: toStatusBucket(syncEvent.status),
+      batchStatus: status.status,
+      batchStatusBucket: status.statusBucket,
+      batchLocalStatus: syncEvent.status,
+      missingOeOrder: status.missingOeOrder,
       oeOrderNumber: document?.sage_document_number || null,
       sageReference: document?.sage_reference || null,
       documentsPosted: document ? 1 : 0,
@@ -2589,13 +2630,14 @@ router.get('/batches', reconAuth, async (req, res) => {
     const pendingSalesCount = batch.event_type === SALES_EVENT_TYPE
       ? Math.max(Number(batch.transaction_count || 0) - orderExportCount, 0)
       : 0;
-    const missingOeOrder = batch.event_type === SALES_EVENT_TYPE && pendingSalesCount > 0;
+    const status = reportingBatchStatus(syncEvent, pendingSalesCount);
     return {
       id: batch.sync_event_id,
       eventType: batch.event_type,
       label: EVENT_TYPE_LABELS[batch.event_type] || batch.event_type,
-      status: syncEvent.status,
-      statusBucket: toStatusBucket(syncEvent.status),
+      status: status.status,
+      statusBucket: status.statusBucket,
+      localStatus: syncEvent.status,
       storeId: batch.store_id,
       branchId: batch.branch_id || 'Unassigned',
       terminalId: batch.terminal_id || 'Unassigned',
@@ -2605,9 +2647,9 @@ router.get('/batches', reconAuth, async (req, res) => {
       creditNoteTotal: roundCurrency(batch.credit_note_total),
       exportedCount: eventExports.length,
       pendingSalesCount,
-      missingOeOrder,
-      attentionReason: missingOeOrder ? 'Completed locally but missing Sage OE order' : normalizeBatchFailureReason(syncEvent),
-      canTryPost: missingOeOrder,
+      missingOeOrder: status.missingOeOrder,
+      attentionReason: status.attentionReason,
+      canTryPost: status.missingOeOrder,
       batchDate: batch.batch_date,
       receivedAt: batch.received_at,
       processedAt: syncEvent.processed_at,
@@ -2670,6 +2712,147 @@ router.post('/batches/:id/requeue', reconAuth, requireReconRole('admin'), async 
     jobId: job.id,
     event: serializeSyncEvent(syncEvent),
   });
+});
+
+router.post('/batches/:id/post-missing-oe', reconAuth, requireReconRole('admin'), async (req, res) => {
+  const models = req.app.locals.models;
+  const syncEvent = await models.syncEvent.findByPk(req.params.id);
+  const body = req.body || {};
+
+  if (!syncEvent) {
+    return res.status(404).json({ message: 'Sync event not found' });
+  }
+
+  if (syncEvent.event_type !== SALES_EVENT_TYPE) {
+    return res.status(400).json({ message: 'Missing OE recovery is only supported for day-end batches' });
+  }
+
+  if (syncEvent.status !== 'completed') {
+    return res.status(409).json({ message: 'Use the normal retry flow for batches that have not completed locally' });
+  }
+
+  const expectedIdempotencyKey = String(body.expectedIdempotencyKey || '').trim();
+  if (expectedIdempotencyKey && expectedIdempotencyKey !== syncEvent.idempotency_key) {
+    return res.status(409).json({ message: 'Batch changed since this page loaded. Refresh and try again.' });
+  }
+
+  const expectedPendingSalesCount = Number(body.expectedPendingSalesCount);
+  const dispatchService = new EventDispatchService(models);
+  const { pendingSales, existingExports } = await dispatchService.resolvePendingSales(syncEvent, 'oe_order');
+
+  if (Number.isFinite(expectedPendingSalesCount) && expectedPendingSalesCount !== pendingSales.length) {
+    return res.status(409).json({
+      success: false,
+      message: `Pending sales changed from ${expectedPendingSalesCount} to ${pendingSales.length}. Refresh and review before posting.`,
+      pendingSalesCount: pendingSales.length,
+      skippedCount: existingExports.length,
+    });
+  }
+
+  if (pendingSales.length === 0) {
+    await logReconRequestAudit(models, req, {
+      action: 'sage.missing_oe_post',
+      outcome: 'noop',
+      entityType: 'sync_event',
+      ...buildActorFromReconUser(req.reconUser),
+      target_identifier: String(syncEvent.id),
+      details: {
+        idempotencyKey: syncEvent.idempotency_key,
+        skippedCount: existingExports.length,
+        reason: 'no_pending_sales',
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: 'All sales in this batch already have an OE order export record.',
+      reconciledCount: 0,
+      skippedCount: existingExports.length,
+      eventId: syncEvent.id,
+      event: serializeSyncEvent(syncEvent),
+    });
+  }
+
+  await logReconRequestAudit(models, req, {
+    action: 'sage.missing_oe_post',
+    outcome: 'started',
+    entityType: 'sync_event',
+    ...buildActorFromReconUser(req.reconUser),
+    target_identifier: String(syncEvent.id),
+    details: {
+      idempotencyKey: syncEvent.idempotency_key,
+      pendingSalesCount: pendingSales.length,
+      skippedCount: existingExports.length,
+    },
+  });
+
+  try {
+    const result = await dispatchService.reconcileDayEndExports(syncEvent, { repost: true });
+
+    await syncEvent.update({
+      status: result.success === false ? 'failed' : 'completed',
+      processed_at: result.success === false ? syncEvent.processed_at : new Date(),
+      last_attempt_at: new Date(),
+      last_error: result.success === false ? (result.message || 'Failed to post missing OE batch to Sage.') : null,
+      response_payload: result,
+    });
+
+    await logReconRequestAudit(models, req, {
+      action: 'sage.missing_oe_post',
+      outcome: result.success === false ? 'failed' : 'success',
+      entityType: 'sync_event',
+      ...buildActorFromReconUser(req.reconUser),
+      target_identifier: String(syncEvent.id),
+      details: {
+        idempotencyKey: syncEvent.idempotency_key,
+        pendingSalesCount: pendingSales.length,
+        reconciledCount: result.reconciledCount || 0,
+        skippedCount: result.skippedCount || existingExports.length,
+        orderNumber: result.orderNumber || null,
+        orderReference: result.orderReference || null,
+      },
+    });
+
+    return res.status(result.success ? 200 : 422).json({
+      ...result,
+      eventId: syncEvent.id,
+      event: serializeSyncEvent(await models.syncEvent.findByPk(syncEvent.id)),
+    });
+  } catch (error) {
+    const sageErrorPayload = error.sageErrorPayload || error.response?.data || { message: error.message };
+    const readableMessage = extractReadableMessage(sageErrorPayload)
+      || error.message
+      || 'Failed to post missing OE batch to Sage.';
+
+    await syncEvent.update({
+      status: 'failed',
+      retry_count: (syncEvent.retry_count || 0) + 1,
+      last_error: readableMessage,
+      response_payload: sageErrorPayload,
+      last_attempt_at: new Date(),
+    });
+
+    await logReconRequestAudit(models, req, {
+      action: 'sage.missing_oe_post',
+      outcome: 'failed',
+      entityType: 'sync_event',
+      ...buildActorFromReconUser(req.reconUser),
+      target_identifier: String(syncEvent.id),
+      details: {
+        idempotencyKey: syncEvent.idempotency_key,
+        pendingSalesCount: pendingSales.length,
+        skippedCount: existingExports.length,
+        error: readableMessage,
+      },
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: readableMessage,
+      eventId: syncEvent.id,
+      event: serializeSyncEvent(await models.syncEvent.findByPk(syncEvent.id)),
+    });
+  }
 });
 
 router.post('/batches/:id/reconcile', reconAuth, requireReconRole('admin'), async (req, res) => {
