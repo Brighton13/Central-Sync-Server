@@ -905,7 +905,11 @@ router.get('/summary', reconAuth, async (req, res) => {
   const creditWhere = { credit_note_date: projectionDateWhere(dateRange) };
   const [saleEventRows, creditEventRows] = await Promise.all([
     models.reconSale.findAll({
-      attributes: ['sync_event_id'],
+      attributes: [
+        'sync_event_id',
+        [fn('COUNT', col('id')), 'sales_count'],
+        [fn('SUM', col('posted_to_sage')), 'posted_count'],
+      ],
       where: saleWhere,
       group: ['sync_event_id'],
       raw: true,
@@ -967,7 +971,39 @@ router.get('/summary', reconAuth, async (req, res) => {
   ]);
 
   const batches = batchRecords.map((record) => record.toJSON());
-  const recentBatches = batches.slice(0, limit);
+  const pendingSalesByEvent = new Map(saleEventRows.map((row) => {
+    const salesCount = Number(row.sales_count || 0);
+    const postedCount = Number(row.posted_count || 0);
+    return [row.sync_event_id, Math.max(salesCount - postedCount, 0)];
+  }));
+  const recentBatches = [];
+  const recentBatchIds = new Set();
+
+  for (const batch of batches) {
+    const syncEvent = projectionEvent(batch);
+    const pendingSalesCount = pendingSalesByEvent.get(batch.sync_event_id) || 0;
+    const needsAttention = toStatusBucket(syncEvent.status) !== 'completed' || pendingSalesCount > 0;
+
+    if (needsAttention && !recentBatchIds.has(batch.sync_event_id)) {
+      recentBatches.push(batch);
+      recentBatchIds.add(batch.sync_event_id);
+    }
+
+    if (recentBatches.length >= limit) {
+      break;
+    }
+  }
+
+  for (const batch of batches) {
+    if (recentBatches.length >= limit) {
+      break;
+    }
+
+    if (!recentBatchIds.has(batch.sync_event_id)) {
+      recentBatches.push(batch);
+      recentBatchIds.add(batch.sync_event_id);
+    }
+  }
   const recentEventIds = recentBatches.map((batch) => batch.sync_event_id);
   const recentBatchExports = recentEventIds.length > 0
     ? await models.syncSaleExport.findAll({
@@ -1037,7 +1073,7 @@ router.get('/summary', reconAuth, async (req, res) => {
     const eventExports = exportsByEvent.get(batch.sync_event_id) || [];
     const references = Array.from(new Set(eventExports.map((row) => row.sage_reference).filter(Boolean)));
     const pendingSalesCount = batch.event_type === SALES_EVENT_TYPE
-      ? Math.max(Number(batch.transaction_count || 0) - eventExports.filter((row) => row.document_type === 'oe_order').length, 0)
+      ? (pendingSalesByEvent.get(batch.sync_event_id) || 0)
       : 0;
     return {
       id: batch.sync_event_id,
