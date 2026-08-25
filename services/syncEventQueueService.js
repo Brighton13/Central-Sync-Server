@@ -51,7 +51,7 @@ async function recoverIncompleteEvents(models, queueEvent = queueSyncEvent) {
       where: {
         id: { [Op.gt]: lastId },
         status: {
-          [Op.in]: ['received', 'queued', 'failed', 'dead_letter'],
+          [Op.in]: ['received', 'queued', 'processing'],
         },
       },
       attributes: ['id', 'event_type', 'status'],

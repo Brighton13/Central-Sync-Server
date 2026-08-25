@@ -1,5 +1,6 @@
 const SageOrdersService = require('./sage/createSageOrder');
 const SageCreditNoteService = require('./sage/createSageCreditNote');
+const SageInternalUsageService = require('./sage/createSageInternalUsage');
 const SyncSaleExportService = require('./syncSaleExportService');
 
 const DOCUMENT_TYPES = {
@@ -12,6 +13,7 @@ class EventDispatchService {
     this.models = models;
     this.sageOrdersService = new SageOrdersService();
     this.sageCreditNoteService = new SageCreditNoteService();
+    this.sageInternalUsageService = new SageInternalUsageService();
     this.syncSaleExportService = new SyncSaleExportService(models);
   }
 
@@ -263,6 +265,14 @@ class EventDispatchService {
         ...result,
         skippedSalesCount: existingExports.length,
         persistedSalesCount: persistedOrderExports.length,
+      };
+    }
+
+    if (syncEvent.event_type === 'stock_return.zeroed') {
+      const result = await this.sageInternalUsageService.createStockReturn(syncEvent.payload || {});
+      return {
+        ...result,
+        stockReturnReference: syncEvent.payload?.document_number || syncEvent.receipt_number || null,
       };
     }
 

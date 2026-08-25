@@ -137,4 +137,30 @@ router.get('/events', syncAuth, async (req, res) => {
   });
 });
 
+router.get('/events/status/:idempotencyKey', syncAuth, async (req, res) => {
+  const models = req.app.locals.models;
+  const syncEvent = await models.syncEvent.findOne({
+    where: { idempotency_key: req.params.idempotencyKey },
+  });
+
+  if (!syncEvent) {
+    return res.status(404).json({
+      success: false,
+      message: 'Sync event was not found',
+      idempotencyKey: req.params.idempotencyKey,
+    });
+  }
+
+  return res.json({
+    success: true,
+    eventId: syncEvent.id,
+    status: syncEvent.status,
+    retryCount: syncEvent.retry_count || 0,
+    lastError: syncEvent.last_error || null,
+    idempotencyKey: syncEvent.idempotency_key,
+    responsePayload: syncEvent.response_payload || null,
+    event: serializeSyncEvent(syncEvent),
+  });
+});
+
 module.exports = router;

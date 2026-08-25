@@ -7,6 +7,7 @@ const customerRoutes = require('./routes/customers');
 const reconciliationRoutes = require('./routes/reconciliation');
 const syncRoutes = require('./routes/sync');
 const updateRoutes = require('./routes/updates');
+const catalogRoutes = require('./routes/catalog');
 
 const app = express();
 
@@ -23,6 +24,7 @@ app.use('/api/recon/auth', reconAuthRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/recon', reconciliationRoutes);
 app.use('/api/sync', syncRoutes);
+app.use('/api/catalog', catalogRoutes);
 
 app.use((error, req, res, next) => {
   if (res.headersSent) {

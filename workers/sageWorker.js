@@ -83,6 +83,31 @@ function createSageWorker(models) {
           || error.response?.data?.error?.message
           || error.response?.data?.message
           || error.message;
+        const statusCode = error.sageErrorPayload?.status || error.response?.status || null;
+
+        if (statusCode === 409) {
+          await syncEvent.update({
+            status: 'failed',
+            retry_count: retryCount,
+            last_error: typeof lastError === 'string' ? lastError : JSON.stringify(lastError),
+            response_payload: {
+              ...sageErrorPayload,
+              nonRetryable: true,
+              message: 'Sage returned HTTP 409 conflict. Event was stopped to avoid an endless startup retry loop.',
+            },
+            last_attempt_at: new Date(),
+          });
+
+          return {
+            success: false,
+            stopped: true,
+            nonRetryable: true,
+            status: 409,
+            message: 'Sage returned HTTP 409 conflict. Event marked failed for reconciliation.',
+            syncEventId: syncEvent.id,
+            idempotencyKey: syncEvent.idempotency_key,
+          };
+        }
 
         await syncEvent.update({
           status: 'queued',
